@@ -1,0 +1,107 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+# mlugg/setup-zig still ships as a node20 action; opt into the node24 runtime
+# now so we don't emit the deprecation warning.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    name: build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: linux
+            arch: arm64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          - os: darwin
+            arch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - os: darwin
+            arch: amd64
+            runner: macos-14
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Linux artifacts are static musl builds so they run on any glibc.
+      # cargo-zigbuild cross-compiles both linux arches from the x86 runner.
+      - name: Set up zig + cargo-zigbuild (linux)
+        if: matrix.os == 'linux'
+        uses: mlugg/setup-zig@v2.2.1
+      - name: Install cargo-zigbuild (linux)
+        if: matrix.os == 'linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build yt
+        run: |
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/yt" "dist/yt-${{ matrix.os }}-${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: yt-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/yt-${{ matrix.os }}-${{ matrix.arch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Compute checksums
+        working-directory: dist
+        run: sha256sum yt-* > SHA256SUMS
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/yt-*
+            dist/SHA256SUMS
