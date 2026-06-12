@@ -30,6 +30,22 @@ Save credentials once (written to `~/.config/yt/config.json`, mode 600):
 yt auth https://youtrack.example.com perm-...   # token "-" reads stdin
 ```
 
+### Multiple servers
+
+Credentials are keyed by server name, so one config can hold several instances:
+
+```sh
+yt auth https://yt.example.com perm-...          # no name -> "default" (first added becomes default)
+yt auth https://yt.acme.com perm-... acme        # named server
+yt servers                                       # list servers (* marks the default)
+yt default acme                                  # change the default
+yt --server acme ls "project: ACME #Unresolved"  # one-off override for any command
+```
+
+Resolution order for every command: `YOUTRACK_URL`/`YOUTRACK_API_TOKEN` env vars
+(when no `--server` is given) → `--server NAME` → the configured default. A
+legacy single-server `config.json` is read transparently as the `default` server.
+
 `YOUTRACK_URL` / `YOUTRACK_API_TOKEN` env vars override the config file when set.
 
 ## Usage
@@ -46,7 +62,10 @@ yt fields PROJECT                     fields + allowed values (falls back to obs
                                       values when the token lacks project-admin rights)
 yt me / yt users QUERY                user info
 yt query-help                         query syntax cheat sheet
-yt auth URL TOKEN                     save credentials to ~/.config/yt/config.json
+yt auth URL TOKEN [NAME]              save credentials (NAME defaults to "default")
+yt servers                            list configured servers (* marks the default)
+yt default NAME                       set the default server
+--server NAME                         (global) use a named server for any command
 ```
 
 `-f` on `new` uses YouTrack command syntax and is applied right after creation

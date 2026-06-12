@@ -10,6 +10,9 @@ const COMMENT_FIELDS: &str = "created,text,author(login)";
 #[derive(Parser)]
 #[command(name = "yt", version, about = "Token-frugal YouTrack CLI (env: YOUTRACK_URL, YOUTRACK_API_TOKEN)")]
 struct Cli {
+    /// Use a named server from config (env vars still take precedence)
+    #[arg(long, global = true)]
+    server: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -75,6 +78,15 @@ enum Cmd {
         url: String,
         /// Permanent API token ("-" reads stdin)
         token: String,
+        /// Server name; defaults to "default" (warns if overwriting an existing default)
+        name: Option<String>,
+    },
+    /// List configured servers (* marks the default)
+    Servers,
+    /// Set the default server
+    Default {
+        /// Server name
+        name: String,
     },
 }
 
@@ -86,25 +98,82 @@ fn config_path() -> std::path::PathBuf {
         .join("yt/config.json")
 }
 
+/// On-disk config: {"default": "<name>", "servers": {"<name>": {"url","token"}}}.
+/// Transparently migrates the legacy {"url","token"} single-server shape.
+#[derive(Default)]
+struct Config {
+    default: Option<String>,
+    servers: std::collections::BTreeMap<String, (String, String)>,
+}
+
+impl Config {
+    fn load() -> Result<Self> {
+        let path = config_path();
+        let Ok(s) = std::fs::read_to_string(&path) else { return Ok(Self::default()) };
+        let cfg: Value =
+            serde_json::from_str(&s).with_context(|| format!("invalid JSON in {}", path.display()))?;
+        let mut servers = std::collections::BTreeMap::new();
+        if let Some(obj) = cfg["servers"].as_object() {
+            for (name, v) in obj {
+                if let (Some(u), Some(t)) = (v["url"].as_str(), v["token"].as_str()) {
+                    servers.insert(name.clone(), (u.to_string(), t.to_string()));
+                }
+            }
+        } else if let (Some(u), Some(t)) = (cfg["url"].as_str(), cfg["token"].as_str()) {
+            // legacy single-server config
+            servers.insert("default".into(), (u.to_string(), t.to_string()));
+        }
+        let default = cfg["default"].as_str().map(String::from);
+        Ok(Self { default, servers })
+    }
+
+    fn save(&self) -> Result<()> {
+        let path = config_path();
+        std::fs::create_dir_all(path.parent().context("no config dir")?)?;
+        let servers: serde_json::Map<String, Value> = self
+            .servers
+            .iter()
+            .map(|(name, (u, t))| (name.clone(), json!({"url": u, "token": t})))
+            .collect();
+        let cfg = json!({"default": self.default, "servers": servers});
+        std::fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+}
+
 struct Client {
     base: String,
     token: String,
 }
 
 impl Client {
-    fn from_env() -> Result<Self> {
-        let mut url = std::env::var("YOUTRACK_URL").ok();
-        let mut token = std::env::var("YOUTRACK_API_TOKEN").ok();
-        if url.is_none() || token.is_none() {
-            if let Ok(s) = std::fs::read_to_string(config_path()) {
-                let cfg: Value = serde_json::from_str(&s)
-                    .with_context(|| format!("invalid JSON in {}", config_path().display()))?;
-                url = url.or_else(|| cfg["url"].as_str().map(String::from));
-                token = token.or_else(|| cfg["token"].as_str().map(String::from));
+    fn resolve(server: Option<&str>) -> Result<Self> {
+        let env_url = std::env::var("YOUTRACK_URL").ok();
+        let env_token = std::env::var("YOUTRACK_API_TOKEN").ok();
+        let (url, token) = match (env_url, env_token) {
+            // both env vars present (and no explicit --server): use them directly
+            (Some(u), Some(t)) if server.is_none() => (u, t),
+            _ => {
+                let cfg = Config::load()?;
+                let name = match server {
+                    Some(s) => s.to_string(),
+                    None => cfg.default.clone().or_else(|| {
+                        // single configured server is unambiguous
+                        (cfg.servers.len() == 1).then(|| cfg.servers.keys().next().unwrap().clone())
+                    }).context("no server selected: set a default with `yt default NAME`, pass --server, or set YOUTRACK_URL")?,
+                };
+                let (u, t) = cfg
+                    .servers
+                    .get(&name)
+                    .with_context(|| format!("no server named '{name}': run `yt auth URL TOKEN {name}`"))?;
+                (u.clone(), t.clone())
             }
-        }
-        let url = url.context("no YouTrack URL: set YOUTRACK_URL or run `yt auth URL TOKEN`")?;
-        let token = token.context("no API token: set YOUTRACK_API_TOKEN or run `yt auth URL TOKEN`")?;
+        };
         let url = url.trim_end_matches('/');
         let base = if url.ends_with("/api") { url.to_string() } else { format!("{url}/api") };
         Ok(Self { base, token })
@@ -252,20 +321,44 @@ fn run() -> Result<()> {
         println!("{QUERY_HELP}");
         return Ok(());
     }
-    if let Cmd::Auth { url, token } = &cli.cmd {
+    if let Cmd::Auth { url, token, name } = &cli.cmd {
         let token = if token == "-" { stdin_text()? } else { token.clone() };
-        let path = config_path();
-        std::fs::create_dir_all(path.parent().context("no config dir")?)?;
-        std::fs::write(&path, serde_json::to_string_pretty(&json!({"url": url, "token": token}))?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let mut cfg = Config::load()?;
+        let name = name.clone().unwrap_or_else(|| "default".to_string());
+        if name == "default" && cfg.servers.contains_key("default") {
+            eprintln!("warning: overwriting existing 'default' server (pass a name to keep both)");
         }
-        println!("saved {}", path.display());
+        cfg.servers.insert(name.clone(), (url.clone(), token));
+        // first server added becomes the default
+        if cfg.default.is_none() {
+            cfg.default = Some(name.clone());
+        }
+        cfg.save()?;
+        println!("saved server '{name}' to {}", config_path().display());
         return Ok(());
     }
-    let c = Client::from_env()?;
+    if let Cmd::Servers = cli.cmd {
+        let cfg = Config::load()?;
+        if cfg.servers.is_empty() {
+            println!("no servers configured; run `yt auth URL TOKEN [name]`");
+        }
+        for (name, (url, _)) in &cfg.servers {
+            let mark = if cfg.default.as_deref() == Some(name) { "*" } else { " " };
+            println!("{mark} {name}  {url}");
+        }
+        return Ok(());
+    }
+    if let Cmd::Default { name } = &cli.cmd {
+        let mut cfg = Config::load()?;
+        if !cfg.servers.contains_key(name) {
+            bail!("no server named '{name}': run `yt servers` to list");
+        }
+        cfg.default = Some(name.clone());
+        cfg.save()?;
+        println!("default server is now '{name}'");
+        return Ok(());
+    }
+    let c = Client::resolve(cli.server.as_deref())?;
 
     match cli.cmd {
         Cmd::Ls { query, limit, full } => {
@@ -434,7 +527,7 @@ fn run() -> Result<()> {
                 println!("{}  {}", u["login"].as_str().unwrap_or("?"), u["name"].as_str().unwrap_or(""));
             }
         }
-        Cmd::QueryHelp | Cmd::Auth { .. } => unreachable!(),
+        Cmd::QueryHelp | Cmd::Auth { .. } | Cmd::Servers | Cmd::Default { .. } => unreachable!(),
     }
     Ok(())
 }
