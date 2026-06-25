@@ -78,21 +78,39 @@ yt completions SHELL                  print a completion script (bash|zsh|fish|p
 
 ### Shell completions
 
-Generate a completion script for your shell and source it:
+`yt completions <shell>` prints a completion script to stdout. Drop it in the
+right place for your shell — copy-paste one block:
 
-```sh
-yt completions bash > ~/.local/share/bash-completion/completions/yt
-yt completions zsh  > "${fpath[1]}/_yt"
+**fish**
+```fish
+mkdir -p ~/.config/fish/completions
 yt completions fish > ~/.config/fish/completions/yt.fish
 ```
 
+**bash**
+```bash
+mkdir -p ~/.local/share/bash-completion/completions
+yt completions bash > ~/.local/share/bash-completion/completions/yt
+```
+
+**zsh** (any dir on your `$fpath`)
+```zsh
+yt completions zsh > "${fpath[1]}/_yt"
+```
+
+New shells pick it up automatically. To use it in the **current** shell without
+opening a new one, source the file (e.g. `source ~/.config/fish/completions/yt.fish`).
+Re-run the command after upgrading `yt` to refresh completions for new commands.
+
 ### Color
 
-`yt` mostly prints plain, line-oriented output; clap's own help/error messages
-are colorized. Output is routed through [`anstream`](https://docs.rs/anstream),
-so color is auto-disabled when stdout/stderr is not a TTY (e.g. piped to a file
-or another program) and honors the `NO_COLOR` and `CLICOLOR`/`CLICOLOR_FORCE`
-environment variables — agent-safe by default.
+`ls` colorizes issue IDs, State (green = resolved, yellow = active), and
+Priority (red = critical/major, dim = minor); `show` highlights the issue ID.
+clap's help/error messages are colorized too. Output is routed through
+[`anstream`](https://docs.rs/anstream), so color is auto-disabled when
+stdout/stderr is not a TTY (e.g. piped to a file or another program) and honors
+the `NO_COLOR` and `CLICOLOR`/`CLICOLOR_FORCE` environment variables — agent-safe
+by default.
 
 `-f` on `new` uses YouTrack command syntax and is applied right after creation
 (`-f "Priority Critical" -f "Type Bug"`).
