@@ -290,11 +290,20 @@ impl Client {
         read(self.req("DELETE", path, &[]).call())
     }
 
+    /// Host root (base minus the trailing `/api`), for building web/file URLs.
+    fn host(&self) -> &str {
+        self.base.strip_suffix("/api").unwrap_or(&self.base)
+    }
+
+    /// Browser URL for an issue, e.g. https://yt.example.com/issue/YT-1.
+    fn web_url(&self, id: &str) -> String {
+        format!("{}/issue/{}", self.host(), id)
+    }
+
     /// Fetch raw bytes from a server-relative URL (the attachment `url` field is
     /// relative to the host root, e.g. "/api/files/..."), with the auth header.
     fn get_bytes(&self, rel_url: &str) -> Result<Vec<u8>> {
-        let host = self.base.strip_suffix("/api").unwrap_or(&self.base);
-        let url = format!("{host}{rel_url}");
+        let url = format!("{}{rel_url}", self.host());
         let res = ureq::get(&url)
             .set("Authorization", &format!("Bearer {}", self.token))
             .call();
@@ -708,6 +717,13 @@ fn run() -> Result<()> {
                 meta.push(format!("by:{r}"));
             }
             println!("{}", meta.join("  "));
+            let link = Style::new()
+                .underline()
+                .fg_color(Some(AnsiColor::Blue.into()));
+            anstream::println!(
+                "{link}{}{link:#}",
+                c.web_url(i["idReadable"].as_str().unwrap_or(&id))
+            );
             if let Some(d) = i["description"].as_str().filter(|d| !d.is_empty()) {
                 println!("\n{}", d.trim_end());
             }
