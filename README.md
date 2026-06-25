@@ -72,8 +72,27 @@ yt query-help                         query syntax cheat sheet
 yt auth URL TOKEN [NAME]              save credentials (NAME defaults to "default")
 yt servers                            list configured servers (* marks the default)
 yt default NAME                       set the default server
+yt completions SHELL                  print a completion script (bash|zsh|fish|powershell|elvish)
 --server NAME                         (global) use a named server for any command
 ```
+
+### Shell completions
+
+Generate a completion script for your shell and source it:
+
+```sh
+yt completions bash > ~/.local/share/bash-completion/completions/yt
+yt completions zsh  > "${fpath[1]}/_yt"
+yt completions fish > ~/.config/fish/completions/yt.fish
+```
+
+### Color
+
+`yt` mostly prints plain, line-oriented output; clap's own help/error messages
+are colorized. Output is routed through [`anstream`](https://docs.rs/anstream),
+so color is auto-disabled when stdout/stderr is not a TTY (e.g. piped to a file
+or another program) and honors the `NO_COLOR` and `CLICOLOR`/`CLICOLOR_FORCE`
+environment variables — agent-safe by default.
 
 `-f` on `new` uses YouTrack command syntax and is applied right after creation
 (`-f "Priority Critical" -f "Type Bug"`).

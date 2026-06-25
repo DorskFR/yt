@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use serde_json::{json, Value};
 use std::io::Read;
 
@@ -129,6 +130,11 @@ enum Cmd {
     Default {
         /// Server name
         name: String,
+    },
+    /// Print a shell completion script to stdout
+    Completions {
+        /// Target shell
+        shell: Shell,
     },
 }
 
@@ -528,6 +534,12 @@ Examples:
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Cmd::Completions { shell } = cli.cmd {
+        let mut cmd = Cli::command();
+        let name = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, name, &mut anstream::stdout());
+        return Ok(());
+    }
     if let Cmd::QueryHelp = cli.cmd {
         println!("{QUERY_HELP}");
         return Ok(());
@@ -924,7 +936,11 @@ fn run() -> Result<()> {
                 );
             }
         }
-        Cmd::QueryHelp | Cmd::Auth { .. } | Cmd::Servers | Cmd::Default { .. } => unreachable!(),
+        Cmd::QueryHelp
+        | Cmd::Auth { .. }
+        | Cmd::Servers
+        | Cmd::Default { .. }
+        | Cmd::Completions { .. } => unreachable!(),
     }
     Ok(())
 }
