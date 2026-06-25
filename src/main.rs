@@ -8,7 +8,11 @@ const ISSUE_FIELDS: &str = "idReadable,summary,description,created,updated,repor
 const COMMENT_FIELDS: &str = "created,text,author(login)";
 
 #[derive(Parser)]
-#[command(name = "yt", version, about = "Token-frugal YouTrack CLI (env: YOUTRACK_URL, YOUTRACK_API_TOKEN)")]
+#[command(
+    name = "yt",
+    version,
+    about = "Token-frugal YouTrack CLI (env: YOUTRACK_URL, YOUTRACK_API_TOKEN)"
+)]
 struct Cli {
     /// Use a named server from config (env vars still take precedence)
     #[arg(long, global = true)]
@@ -49,11 +53,38 @@ enum Cmd {
         #[arg(short, long)]
         field: Vec<String>,
     },
+    /// Edit an issue's summary and/or description; prints the ID
+    Edit {
+        id: String,
+        /// New summary
+        #[arg(short, long)]
+        summary: Option<String>,
+        /// New description ("-" reads stdin)
+        #[arg(short, long)]
+        desc: Option<String>,
+    },
+    /// List an issue's attachments; -o DIR downloads them
+    Attachments {
+        id: String,
+        /// Download all attachments to DIR (default: current directory)
+        #[arg(short = 'o', long = "out")]
+        out: Option<Option<String>>,
+    },
+    /// Attach one or more files to an issue (or a comment with -c)
+    Attach {
+        id: String,
+        #[arg(required = true)]
+        files: Vec<String>,
+        /// Attach to a specific comment instead of the issue
+        #[arg(short = 'c', long = "comment")]
+        comment: Option<String>,
+    },
     /// Add a comment (text arg, or stdin if omitted)
     Comment { id: String, text: Option<String> },
     /// List an issue's comments
     Comments { id: String },
     /// Apply a YouTrack command to issues, e.g. yt cmd "State Fixed assignee me" DEMO-1 DEMO-2
+    #[allow(clippy::enum_variant_names)]
     Cmd {
         command: String,
         #[arg(required = true)]
@@ -62,8 +93,19 @@ enum Cmd {
         #[arg(short = 'm', long)]
         comment: Option<String>,
     },
+    /// List tags (one name per line)
+    Tags,
+    /// Add a tag (by name) to an issue
+    Tag { id: String, tag: String },
+    /// Remove a tag (by name) from an issue
+    Untag { id: String, tag: String },
     /// List projects
     Projects,
+    /// Manage projects (admin token required for creation)
+    Project {
+        #[command(subcommand)]
+        cmd: ProjectCmd,
+    },
     /// Show a project's custom fields and allowed values
     Fields { project: String },
     /// Show the authenticated user
@@ -90,6 +132,17 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum ProjectCmd {
+    /// Create a project (requires an admin token); prints SHORT  ID
+    New {
+        /// Short name / key, e.g. DEMO
+        short: String,
+        /// Full project name
+        name: String,
+    },
+}
+
 fn config_path() -> std::path::PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
@@ -109,9 +162,17 @@ struct Config {
 impl Config {
     fn load() -> Result<Self> {
         let path = config_path();
-        let Ok(s) = std::fs::read_to_string(&path) else { return Ok(Self::default()) };
-        let cfg: Value =
-            serde_json::from_str(&s).with_context(|| format!("invalid JSON in {}", path.display()))?;
+        let Ok(s) = std::fs::read_to_string(&path) else {
+            return Ok(Self::default());
+        };
+        let cfg: Value = serde_json::from_str(&s)
+            .with_context(|| format!("invalid JSON in {}", path.display()))?;
+        Ok(Self::from_value(&cfg))
+    }
+
+    /// Parse the on-disk JSON shape into a `Config`, transparently migrating the
+    /// legacy single-server `{"url","token"}` layout. Pure: no IO.
+    fn from_value(cfg: &Value) -> Self {
         let mut servers = std::collections::BTreeMap::new();
         if let Some(obj) = cfg["servers"].as_object() {
             for (name, v) in obj {
@@ -124,7 +185,23 @@ impl Config {
             servers.insert("default".into(), (u.to_string(), t.to_string()));
         }
         let default = cfg["default"].as_str().map(String::from);
-        Ok(Self { default, servers })
+        Self { default, servers }
+    }
+
+    /// Pick a server name given an explicit `--server`, falling back to the
+    /// configured default, then to the sole server if exactly one exists. Pure.
+    fn select_server(&self, server: Option<&str>) -> Result<String> {
+        match server {
+            Some(s) => Ok(s.to_string()),
+            None => self
+                .default
+                .clone()
+                .or_else(|| {
+                    // single configured server is unambiguous
+                    (self.servers.len() == 1).then(|| self.servers.keys().next().unwrap().clone())
+                })
+                .context("no server selected: set a default with `yt default NAME`, pass --server, or set YOUTRACK_URL"),
+        }
     }
 
     fn save(&self) -> Result<()> {
@@ -146,6 +223,17 @@ impl Config {
     }
 }
 
+/// Build the base API URL from a configured/env YouTrack URL: strip trailing
+/// slashes and append `/api` unless it is already present. Pure.
+fn normalize_base(url: &str) -> String {
+    let url = url.trim_end_matches('/');
+    if url.ends_with("/api") {
+        url.to_string()
+    } else {
+        format!("{url}/api")
+    }
+}
+
 struct Client {
     base: String,
     token: String,
@@ -160,23 +248,17 @@ impl Client {
             (Some(u), Some(t)) if server.is_none() => (u, t),
             _ => {
                 let cfg = Config::load()?;
-                let name = match server {
-                    Some(s) => s.to_string(),
-                    None => cfg.default.clone().or_else(|| {
-                        // single configured server is unambiguous
-                        (cfg.servers.len() == 1).then(|| cfg.servers.keys().next().unwrap().clone())
-                    }).context("no server selected: set a default with `yt default NAME`, pass --server, or set YOUTRACK_URL")?,
-                };
-                let (u, t) = cfg
-                    .servers
-                    .get(&name)
-                    .with_context(|| format!("no server named '{name}': run `yt auth URL TOKEN {name}`"))?;
+                let name = cfg.select_server(server)?;
+                let (u, t) = cfg.servers.get(&name).with_context(|| {
+                    format!("no server named '{name}': run `yt auth URL TOKEN {name}`")
+                })?;
                 (u.clone(), t.clone())
             }
         };
-        let url = url.trim_end_matches('/');
-        let base = if url.ends_with("/api") { url.to_string() } else { format!("{url}/api") };
-        Ok(Self { base, token })
+        Ok(Self {
+            base: normalize_base(&url),
+            token,
+        })
     }
 
     fn req(&self, method: &str, path: &str, params: &[(&str, &str)]) -> ureq::Request {
@@ -196,13 +278,93 @@ impl Client {
     fn post(&self, path: &str, params: &[(&str, &str)], body: Value) -> Result<Value> {
         read(self.req("POST", path, params).send_json(body))
     }
+
+    fn delete(&self, path: &str) -> Result<Value> {
+        read(self.req("DELETE", path, &[]).call())
+    }
+
+    /// Fetch raw bytes from a server-relative URL (the attachment `url` field is
+    /// relative to the host root, e.g. "/api/files/..."), with the auth header.
+    fn get_bytes(&self, rel_url: &str) -> Result<Vec<u8>> {
+        let host = self.base.strip_suffix("/api").unwrap_or(&self.base);
+        let url = format!("{host}{rel_url}");
+        let res = ureq::get(&url)
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .call();
+        match res {
+            Ok(r) => {
+                let mut buf = Vec::new();
+                r.into_reader().read_to_end(&mut buf)?;
+                Ok(buf)
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let body = r.into_string().unwrap_or_default();
+                bail!("HTTP {code}: {body}")
+            }
+            Err(e) => bail!(e.to_string()),
+        }
+    }
+
+    /// POST a single file as multipart/form-data (field name `file`) to a
+    /// server-relative API path. ureq has no multipart support, so we build the
+    /// body by hand.
+    fn post_file(&self, path: &str, params: &[(&str, &str)], file: &str) -> Result<Value> {
+        let p = std::path::Path::new(file);
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .with_context(|| format!("bad file name: {file}"))?;
+        let data = std::fs::read(p).with_context(|| format!("cannot read {file}"))?;
+        let ctype = content_type(name);
+        let boundary = format!("----ytboundary{:x}", data.len().wrapping_mul(2_654_435_761));
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\
+                 Content-Type: {ctype}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&data);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let res = self
+            .req("POST", path, params)
+            .set(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )
+            .send_bytes(&body);
+        read(res)
+    }
+}
+
+/// Infer a content-type from a file extension for common image types.
+fn content_type(name: &str) -> &'static str {
+    match name
+        .rsplit('.')
+        .next()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
 }
 
 fn read(res: Result<ureq::Response, ureq::Error>) -> Result<Value> {
     match res {
         Ok(r) => {
             let s = r.into_string()?;
-            Ok(if s.is_empty() { Value::Null } else { serde_json::from_str(&s)? })
+            Ok(if s.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_str(&s)?
+            })
         }
         Err(ureq::Error::Status(code, r)) => {
             let body = r.into_string().unwrap_or_default();
@@ -221,7 +383,9 @@ fn read(res: Result<ureq::Response, ureq::Error>) -> Result<Value> {
 
 /// Epoch millis -> YYYY-MM-DD (civil-from-days, Hinnant).
 fn date(v: &Value) -> String {
-    let Some(ms) = v.as_i64() else { return "-".into() };
+    let Some(ms) = v.as_i64() else {
+        return "-".into();
+    };
     let z = ms / 86_400_000 + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -240,7 +404,11 @@ fn cf_value(v: &Value) -> Option<String> {
         Value::Null => None,
         Value::Array(a) => {
             let parts: Vec<_> = a.iter().filter_map(cf_value).collect();
-            if parts.is_empty() { None } else { Some(parts.join(",")) }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(","))
+            }
         }
         Value::Object(o) => o
             .get("login")
@@ -258,7 +426,11 @@ fn cf_get(issue: &Value, name: &str) -> Option<String> {
     issue["customFields"]
         .as_array()?
         .iter()
-        .find(|f| f["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+        .find(|f| {
+            f["name"]
+                .as_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
         .and_then(|f| cf_value(&f["value"]))
 }
 
@@ -269,17 +441,44 @@ fn stdin_text() -> Result<String> {
 }
 
 fn resolve_project(c: &Client, key: &str) -> Result<(String, String)> {
-    let projects = c.get("admin/projects", &[("fields", "id,shortName,name"), ("$top", "500")])?;
+    let projects = c.get(
+        "admin/projects",
+        &[("fields", "id,shortName,name"), ("$top", "500")],
+    )?;
     projects
         .as_array()
         .into_iter()
         .flatten()
         .find(|p| {
-            p["shortName"].as_str().is_some_and(|s| s.eq_ignore_ascii_case(key))
-                || p["name"].as_str().is_some_and(|s| s.eq_ignore_ascii_case(key))
+            p["shortName"]
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case(key))
+                || p["name"]
+                    .as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(key))
         })
-        .map(|p| (p["id"].as_str().unwrap_or_default().to_string(), p["shortName"].as_str().unwrap_or(key).to_string()))
+        .map(|p| {
+            (
+                p["id"].as_str().unwrap_or_default().to_string(),
+                p["shortName"].as_str().unwrap_or(key).to_string(),
+            )
+        })
         .with_context(|| format!("project not found: {key}"))
+}
+
+/// Resolve a tag name to its internal id via GET /api/tags.
+fn resolve_tag(c: &Client, name: &str) -> Result<String> {
+    let tags = c.get("tags", &[("fields", "id,name"), ("$top", "500")])?;
+    tags.as_array()
+        .into_iter()
+        .flatten()
+        .find(|t| {
+            t["name"]
+                .as_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+        .and_then(|t| t["id"].as_str().map(String::from))
+        .with_context(|| format!("tag not found: {name}"))
 }
 
 fn issue_ref(id: &str) -> Value {
@@ -287,17 +486,29 @@ fn issue_ref(id: &str) -> Value {
     let internal = id.split_once('-').is_some_and(|(a, b)| {
         !a.is_empty() && !b.is_empty() && a.chars().chain(b.chars()).all(|c| c.is_ascii_digit())
     });
-    if internal { json!({"id": id}) } else { json!({"idReadable": id}) }
+    if internal {
+        json!({"id": id})
+    } else {
+        json!({"idReadable": id})
+    }
 }
 
 fn print_comments(c: &Client, id: &str) -> Result<()> {
-    let comments = c.get(&format!("issues/{id}/comments"), &[("fields", COMMENT_FIELDS)])?;
+    let comments = c.get(
+        &format!("issues/{id}/comments"),
+        &[("fields", COMMENT_FIELDS)],
+    )?;
     let list = comments.as_array().cloned().unwrap_or_default();
     if list.is_empty() {
         println!("no comments");
     }
     for cm in &list {
-        println!("[{} {}] {}", date(&cm["created"]), cm["author"]["login"].as_str().unwrap_or("?"), cm["text"].as_str().unwrap_or("").trim_end());
+        println!(
+            "[{} {}] {}",
+            date(&cm["created"]),
+            cm["author"]["login"].as_str().unwrap_or("?"),
+            cm["text"].as_str().unwrap_or("").trim_end()
+        );
     }
     Ok(())
 }
@@ -322,7 +533,11 @@ fn run() -> Result<()> {
         return Ok(());
     }
     if let Cmd::Auth { url, token, name } = &cli.cmd {
-        let token = if token == "-" { stdin_text()? } else { token.clone() };
+        let token = if token == "-" {
+            stdin_text()?
+        } else {
+            token.clone()
+        };
         let mut cfg = Config::load()?;
         let name = name.clone().unwrap_or_else(|| "default".to_string());
         if name == "default" && cfg.servers.contains_key("default") {
@@ -343,7 +558,11 @@ fn run() -> Result<()> {
             println!("no servers configured; run `yt auth URL TOKEN [name]`");
         }
         for (name, (url, _)) in &cfg.servers {
-            let mark = if cfg.default.as_deref() == Some(name) { "*" } else { " " };
+            let mark = if cfg.default.as_deref() == Some(name) {
+                "*"
+            } else {
+                " "
+            };
             println!("{mark} {name}  {url}");
         }
         return Ok(());
@@ -362,8 +581,19 @@ fn run() -> Result<()> {
 
     match cli.cmd {
         Cmd::Ls { query, limit, full } => {
-            let fields = if full { format!("{LIST_FIELDS},description") } else { LIST_FIELDS.into() };
-            let issues = c.get("issues", &[("query", &query), ("fields", &fields), ("$top", &limit.to_string())])?;
+            let fields = if full {
+                format!("{LIST_FIELDS},description")
+            } else {
+                LIST_FIELDS.into()
+            };
+            let issues = c.get(
+                "issues",
+                &[
+                    ("query", &query),
+                    ("fields", &fields),
+                    ("$top", &limit.to_string()),
+                ],
+            )?;
             let list = issues.as_array().cloned().unwrap_or_default();
             if list.is_empty() {
                 println!("no matches");
@@ -392,12 +622,22 @@ fn run() -> Result<()> {
         }
         Cmd::Show { id, comments } => {
             let i = c.get(&format!("issues/{id}"), &[("fields", ISSUE_FIELDS)])?;
-            println!("{}  {}", i["idReadable"].as_str().unwrap_or(&id), i["summary"].as_str().unwrap_or(""));
+            println!(
+                "{}  {}",
+                i["idReadable"].as_str().unwrap_or(&id),
+                i["summary"].as_str().unwrap_or("")
+            );
             let mut meta: Vec<String> = i["customFields"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|f| Some(format!("{}:{}", f["name"].as_str()?, cf_value(&f["value"])?)))
+                .filter_map(|f| {
+                    Some(format!(
+                        "{}:{}",
+                        f["name"].as_str()?,
+                        cf_value(&f["value"])?
+                    ))
+                })
                 .collect();
             meta.push(format!("created:{}", date(&i["created"])));
             meta.push(format!("updated:{}", date(&i["updated"])));
@@ -413,7 +653,12 @@ fn run() -> Result<()> {
                 print_comments(&c, i["idReadable"].as_str().unwrap_or(&id))?;
             }
         }
-        Cmd::New { project, summary, desc, field } => {
+        Cmd::New {
+            project,
+            summary,
+            desc,
+            field,
+        } => {
             let (pid, _short) = resolve_project(&c, &project)?;
             let desc = match desc.as_deref() {
                 Some("-") => Some(stdin_text()?),
@@ -424,11 +669,36 @@ fn run() -> Result<()> {
                 body["description"] = json!(d);
             }
             let created = c.post("issues", &[("fields", "idReadable")], body)?;
-            let id = created["idReadable"].as_str().context("create returned no id")?.to_string();
+            let id = created["idReadable"]
+                .as_str()
+                .context("create returned no id")?
+                .to_string();
             if !field.is_empty() {
-                c.post("commands", &[], json!({"query": field.join(" "), "issues": [{"idReadable": id}]}))
-                    .with_context(|| format!("{id} created, but setting fields failed"))?;
+                c.post(
+                    "commands",
+                    &[],
+                    json!({"query": field.join(" "), "issues": [{"idReadable": id}]}),
+                )
+                .with_context(|| format!("{id} created, but setting fields failed"))?;
             }
+            println!("{id}");
+        }
+        Cmd::Edit { id, summary, desc } => {
+            let desc = match desc.as_deref() {
+                Some("-") => Some(stdin_text()?),
+                d => d.map(String::from),
+            };
+            if summary.is_none() && desc.is_none() {
+                bail!("nothing to edit: pass --summary and/or --desc");
+            }
+            let mut body = json!({});
+            if let Some(s) = summary {
+                body["summary"] = json!(s);
+            }
+            if let Some(d) = desc {
+                body["description"] = json!(d);
+            }
+            c.post(&format!("issues/{id}"), &[("fields", "idReadable")], body)?;
             println!("{id}");
         }
         Cmd::Comment { id, text } => {
@@ -443,7 +713,61 @@ fn run() -> Result<()> {
             println!("ok");
         }
         Cmd::Comments { id } => print_comments(&c, &id)?,
-        Cmd::Cmd { command, ids, comment } => {
+        Cmd::Attachments { id, out } => {
+            let atts = c.get(
+                &format!("issues/{id}/attachments"),
+                &[("fields", "id,name,size,url")],
+            )?;
+            let list = atts.as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("no attachments");
+                return Ok(());
+            }
+            match out {
+                None => {
+                    for a in &list {
+                        println!(
+                            "{}  {}",
+                            a["name"].as_str().unwrap_or("?"),
+                            a["size"].as_i64().unwrap_or(0)
+                        );
+                    }
+                }
+                Some(dir) => {
+                    let dir = dir.as_deref().unwrap_or(".");
+                    std::fs::create_dir_all(dir)?;
+                    for a in &list {
+                        let name = a["name"].as_str().unwrap_or("attachment");
+                        let url = a["url"]
+                            .as_str()
+                            .with_context(|| format!("attachment '{name}' has no url"))?;
+                        let bytes = c.get_bytes(url)?;
+                        let path = std::path::Path::new(dir).join(name);
+                        std::fs::write(&path, &bytes)?;
+                        println!("{}  {}", path.display(), bytes.len());
+                    }
+                }
+            }
+        }
+        Cmd::Attach { id, files, comment } => {
+            let path = match &comment {
+                Some(cid) => format!("issues/{id}/comments/{cid}/attachments"),
+                None => format!("issues/{id}/attachments"),
+            };
+            for f in &files {
+                let a = c.post_file(&path, &[("fields", "id,name")], f)?;
+                println!(
+                    "{}  {}",
+                    a["id"].as_str().unwrap_or("?"),
+                    a["name"].as_str().unwrap_or("?")
+                );
+            }
+        }
+        Cmd::Cmd {
+            command,
+            ids,
+            comment,
+        } => {
             let mut body = json!({"query": command, "issues": ids.iter().map(|i| issue_ref(i)).collect::<Vec<_>>()});
             if let Some(m) = comment {
                 body["comment"] = json!(m);
@@ -451,28 +775,87 @@ fn run() -> Result<()> {
             c.post("commands", &[], body)?;
             println!("ok");
         }
+        Cmd::Tags => {
+            let tags = c.get("tags", &[("fields", "id,name"), ("$top", "500")])?;
+            let list = tags.as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("no tags");
+            }
+            for t in &list {
+                println!("{}", t["name"].as_str().unwrap_or("?"));
+            }
+        }
+        Cmd::Tag { id, tag } => {
+            let tid = resolve_tag(&c, &tag)?;
+            c.post(&format!("issues/{id}/tags"), &[], json!({"id": tid}))?;
+            println!("ok");
+        }
+        Cmd::Untag { id, tag } => {
+            let tid = resolve_tag(&c, &tag)?;
+            c.delete(&format!("issues/{id}/tags/{tid}"))?;
+            println!("ok");
+        }
         Cmd::Projects => {
-            let projects = c.get("admin/projects", &[("fields", "shortName,name,archived"), ("$top", "500")])?;
+            let projects = c.get(
+                "admin/projects",
+                &[("fields", "shortName,name,archived"), ("$top", "500")],
+            )?;
             for p in projects.as_array().into_iter().flatten() {
                 if p["archived"].as_bool() != Some(true) {
-                    println!("{}  {}", p["shortName"].as_str().unwrap_or("?"), p["name"].as_str().unwrap_or(""));
+                    println!(
+                        "{}  {}",
+                        p["shortName"].as_str().unwrap_or("?"),
+                        p["name"].as_str().unwrap_or("")
+                    );
                 }
             }
         }
+        Cmd::Project { cmd } => match cmd {
+            ProjectCmd::New { short, name } => {
+                // leader is required; resolve the current user's id to populate it
+                let me = c.get("users/me", &[("fields", "id")])?;
+                let leader = me["id"]
+                    .as_str()
+                    .context("could not resolve current user")?;
+                let created = c.post(
+                    "admin/projects",
+                    &[("fields", "id,shortName")],
+                    json!({"name": name, "shortName": short, "leader": {"id": leader}}),
+                )?;
+                println!(
+                    "{}  {}",
+                    created["shortName"].as_str().unwrap_or(&short),
+                    created["id"].as_str().unwrap_or("?")
+                );
+            }
+        },
         Cmd::Fields { project } => {
             let (pid, short) = resolve_project(&c, &project)?;
             let fields = c.get(
                 &format!("admin/projects/{pid}/customFields"),
-                &[("fields", "canBeEmpty,field(name,fieldType(valueType)),bundle(values(name,archived))"), ("$top", "100")],
+                &[
+                    (
+                        "fields",
+                        "canBeEmpty,field(name,fieldType(valueType)),bundle(values(name,archived))",
+                    ),
+                    ("$top", "100"),
+                ],
             )?;
             let field_list = fields.as_array().cloned().unwrap_or_default();
             if field_list.is_empty() {
                 // field config needs project-admin rights; fall back to values observed on recent issues
                 let issues = c.get(
                     "issues",
-                    &[("query", &format!("project: {short}")), ("fields", "customFields(name,value(name,login,text))"), ("$top", "100")],
+                    &[
+                        ("query", &format!("project: {short}")),
+                        ("fields", "customFields(name,value(name,login,text))"),
+                        ("$top", "100"),
+                    ],
                 )?;
-                let mut seen: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = Default::default();
+                let mut seen: std::collections::BTreeMap<
+                    String,
+                    std::collections::BTreeSet<String>,
+                > = Default::default();
                 for i in issues.as_array().into_iter().flatten() {
                     for f in i["customFields"].as_array().into_iter().flatten() {
                         if let (Some(n), Some(v)) = (f["name"].as_str(), cf_value(&f["value"])) {
@@ -485,14 +868,21 @@ fn run() -> Result<()> {
                 }
                 println!("# {short}: values observed on recent issues (field config not readable with this token)");
                 for (name, values) in &seen {
-                    println!("{name}: {}", values.iter().cloned().collect::<Vec<_>>().join(", "));
+                    println!(
+                        "{name}: {}",
+                        values.iter().cloned().collect::<Vec<_>>().join(", ")
+                    );
                 }
                 return Ok(());
             }
             println!("# {short}: * = required");
             for f in &field_list {
                 let name = f["field"]["name"].as_str().unwrap_or("?");
-                let req = if f["canBeEmpty"].as_bool() == Some(false) { "*" } else { "" };
+                let req = if f["canBeEmpty"].as_bool() == Some(false) {
+                    "*"
+                } else {
+                    ""
+                };
                 let ty = f["field"]["fieldType"]["valueType"].as_str().unwrap_or("?");
                 let values: Vec<_> = f["bundle"]["values"]
                     .as_array()
@@ -518,13 +908,20 @@ fn run() -> Result<()> {
             );
         }
         Cmd::Users { query } => {
-            let users = c.get("users", &[("query", &query), ("fields", "login,name"), ("$top", "10")])?;
+            let users = c.get(
+                "users",
+                &[("query", &query), ("fields", "login,name"), ("$top", "10")],
+            )?;
             let list = users.as_array().cloned().unwrap_or_default();
             if list.is_empty() {
                 println!("no matches");
             }
             for u in &list {
-                println!("{}  {}", u["login"].as_str().unwrap_or("?"), u["name"].as_str().unwrap_or(""));
+                println!(
+                    "{}  {}",
+                    u["login"].as_str().unwrap_or("?"),
+                    u["name"].as_str().unwrap_or("")
+                );
             }
         }
         Cmd::QueryHelp | Cmd::Auth { .. } | Cmd::Servers | Cmd::Default { .. } => unreachable!(),
@@ -536,5 +933,286 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ---- URL normalization ----
+
+    #[test]
+    fn normalize_base_appends_api() {
+        assert_eq!(
+            normalize_base("https://yt.example.com"),
+            "https://yt.example.com/api"
+        );
+    }
+
+    #[test]
+    fn normalize_base_strips_trailing_slash() {
+        assert_eq!(
+            normalize_base("https://yt.example.com/"),
+            "https://yt.example.com/api"
+        );
+    }
+
+    #[test]
+    fn normalize_base_strips_multiple_trailing_slashes() {
+        assert_eq!(
+            normalize_base("https://yt.example.com///"),
+            "https://yt.example.com/api"
+        );
+    }
+
+    #[test]
+    fn normalize_base_keeps_existing_api_suffix() {
+        assert_eq!(
+            normalize_base("https://yt.example.com/api"),
+            "https://yt.example.com/api"
+        );
+    }
+
+    #[test]
+    fn normalize_base_api_suffix_with_trailing_slash() {
+        assert_eq!(
+            normalize_base("https://yt.example.com/api/"),
+            "https://yt.example.com/api"
+        );
+    }
+
+    #[test]
+    fn normalize_base_subpath_gets_api() {
+        // a hosted instance under a subpath should still get /api appended
+        assert_eq!(
+            normalize_base("https://host/youtrack"),
+            "https://host/youtrack/api"
+        );
+    }
+
+    // ---- config: multi-server parsing ----
+
+    #[test]
+    fn config_parses_multi_server() {
+        let cfg = Config::from_value(&json!({
+            "default": "work",
+            "servers": {
+                "work": {"url": "https://work.example.com", "token": "wtok"},
+                "home": {"url": "https://home.example.com", "token": "htok"},
+            }
+        }));
+        assert_eq!(cfg.default.as_deref(), Some("work"));
+        assert_eq!(cfg.servers.len(), 2);
+        assert_eq!(
+            cfg.servers.get("work"),
+            Some(&("https://work.example.com".into(), "wtok".into()))
+        );
+        assert_eq!(
+            cfg.servers.get("home"),
+            Some(&("https://home.example.com".into(), "htok".into()))
+        );
+    }
+
+    #[test]
+    fn config_skips_incomplete_server_entries() {
+        let cfg = Config::from_value(&json!({
+            "servers": {
+                "ok": {"url": "https://ok.example.com", "token": "t"},
+                "notoken": {"url": "https://x.example.com"},
+                "nourl": {"token": "t"},
+            }
+        }));
+        assert_eq!(cfg.servers.len(), 1);
+        assert!(cfg.servers.contains_key("ok"));
+    }
+
+    #[test]
+    fn config_empty_value_is_empty() {
+        let cfg = Config::from_value(&json!({}));
+        assert!(cfg.default.is_none());
+        assert!(cfg.servers.is_empty());
+    }
+
+    // ---- config: legacy flat-config migration ----
+
+    #[test]
+    fn config_migrates_legacy_flat_shape() {
+        let cfg = Config::from_value(&json!({
+            "url": "https://legacy.example.com",
+            "token": "legacytok"
+        }));
+        assert_eq!(cfg.servers.len(), 1);
+        assert_eq!(
+            cfg.servers.get("default"),
+            Some(&("https://legacy.example.com".into(), "legacytok".into()))
+        );
+        // legacy shape carries no explicit default
+        assert!(cfg.default.is_none());
+    }
+
+    #[test]
+    fn config_prefers_servers_over_legacy_keys() {
+        // when both shapes are present, the modern `servers` block wins
+        let cfg = Config::from_value(&json!({
+            "url": "https://legacy.example.com",
+            "token": "legacytok",
+            "servers": {
+                "main": {"url": "https://main.example.com", "token": "mtok"},
+            }
+        }));
+        assert!(cfg.servers.contains_key("main"));
+        assert!(!cfg.servers.contains_key("default"));
+    }
+
+    // ---- config: server selection (env-vs-config precedence + default) ----
+
+    fn cfg_with(default: Option<&str>, names: &[&str]) -> Config {
+        let mut servers = std::collections::BTreeMap::new();
+        for n in names {
+            servers.insert(
+                (*n).to_string(),
+                (format!("https://{n}"), format!("{n}tok")),
+            );
+        }
+        Config {
+            default: default.map(String::from),
+            servers,
+        }
+    }
+
+    #[test]
+    fn select_server_explicit_wins() {
+        let cfg = cfg_with(Some("work"), &["work", "home"]);
+        assert_eq!(cfg.select_server(Some("home")).unwrap(), "home");
+    }
+
+    #[test]
+    fn select_server_falls_back_to_default() {
+        let cfg = cfg_with(Some("work"), &["work", "home"]);
+        assert_eq!(cfg.select_server(None).unwrap(), "work");
+    }
+
+    #[test]
+    fn select_server_single_server_is_unambiguous() {
+        let cfg = cfg_with(None, &["only"]);
+        assert_eq!(cfg.select_server(None).unwrap(), "only");
+    }
+
+    #[test]
+    fn select_server_ambiguous_without_default_errors() {
+        let cfg = cfg_with(None, &["a", "b"]);
+        assert!(cfg.select_server(None).is_err());
+    }
+
+    #[test]
+    fn select_server_no_servers_errors() {
+        let cfg = cfg_with(None, &[]);
+        assert!(cfg.select_server(None).is_err());
+    }
+
+    // Env-vs-config precedence: when both env vars are set and no --server is
+    // passed, Client::resolve uses the env values directly and never touches the
+    // config file. We exercise that branch with a custom-URL env to also cover
+    // normalization end-to-end. (Set/remove env in one test to avoid cross-test
+    // interference since env is process-global.)
+    #[test]
+    fn resolve_prefers_env_over_config() {
+        std::env::set_var("YOUTRACK_URL", "https://env.example.com/");
+        std::env::set_var("YOUTRACK_API_TOKEN", "envtok");
+        let c = Client::resolve(None).unwrap();
+        std::env::remove_var("YOUTRACK_URL");
+        std::env::remove_var("YOUTRACK_API_TOKEN");
+        assert_eq!(c.base, "https://env.example.com/api");
+        assert_eq!(c.token, "envtok");
+    }
+
+    // ---- compact output formatting helpers ----
+
+    #[test]
+    fn date_formats_epoch_millis() {
+        // 2026-06-25 00:00:00 UTC
+        assert_eq!(date(&json!(1_782_345_600_000i64)), "2026-06-25");
+        // unix epoch
+        assert_eq!(date(&json!(0i64)), "1970-01-01");
+    }
+
+    #[test]
+    fn date_non_number_is_dash() {
+        assert_eq!(date(&json!(null)), "-");
+        assert_eq!(date(&json!("nope")), "-");
+    }
+
+    #[test]
+    fn cf_value_picks_name() {
+        assert_eq!(cf_value(&json!({"name": "Open"})).as_deref(), Some("Open"));
+    }
+
+    #[test]
+    fn cf_value_prefers_login_over_name() {
+        assert_eq!(
+            cf_value(&json!({"login": "alice", "name": "Alice A"})).as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[test]
+    fn cf_value_joins_array() {
+        let v = json!([{"name": "Bug"}, {"name": "Critical"}]);
+        assert_eq!(cf_value(&v).as_deref(), Some("Bug,Critical"));
+    }
+
+    #[test]
+    fn cf_value_empty_is_none() {
+        assert_eq!(cf_value(&json!(null)), None);
+        assert_eq!(cf_value(&json!([])), None);
+        // an array of empties collapses to None
+        assert_eq!(cf_value(&json!([null, null])), None);
+    }
+
+    #[test]
+    fn cf_value_large_number_is_date() {
+        // numbers above the threshold are treated as epoch-millis dates
+        assert_eq!(
+            cf_value(&json!(1_782_345_600_000i64)).as_deref(),
+            Some("2026-06-25")
+        );
+    }
+
+    #[test]
+    fn cf_value_small_number_is_plain() {
+        assert_eq!(cf_value(&json!(42)).as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn cf_get_matches_case_insensitively() {
+        let issue = json!({
+            "customFields": [
+                {"name": "State", "value": {"name": "Open"}},
+                {"name": "Priority", "value": {"name": "Critical"}},
+            ]
+        });
+        assert_eq!(cf_get(&issue, "state").as_deref(), Some("Open"));
+        assert_eq!(cf_get(&issue, "PRIORITY").as_deref(), Some("Critical"));
+        assert_eq!(cf_get(&issue, "Assignee"), None);
+    }
+
+    #[test]
+    fn issue_ref_distinguishes_internal_vs_readable() {
+        // internal ids are all-digit "N-M"
+        assert_eq!(issue_ref("2-123"), json!({"id": "2-123"}));
+        // readable ids (project-prefixed) use idReadable
+        assert_eq!(issue_ref("DEMO-1"), json!({"idReadable": "DEMO-1"}));
+    }
+
+    #[test]
+    fn content_type_maps_extensions() {
+        assert_eq!(content_type("a.png"), "image/png");
+        assert_eq!(content_type("a.JPG"), "image/jpeg");
+        assert_eq!(content_type("a.jpeg"), "image/jpeg");
+        assert_eq!(content_type("a.svg"), "image/svg+xml");
+        assert_eq!(content_type("a.bin"), "application/octet-stream");
+        assert_eq!(content_type("noext"), "application/octet-stream");
     }
 }
