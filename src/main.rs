@@ -1,3 +1,4 @@
+use anstyle::{AnsiColor, Style};
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -440,6 +441,52 @@ fn cf_get(issue: &Value, name: &str) -> Option<String> {
         .and_then(|f| cf_value(&f["value"]))
 }
 
+// --- output styling -------------------------------------------------------
+// Styles are emitted via anstream macros, which strip ANSI when stdout is not
+// a TTY and honor NO_COLOR / CLICOLOR — so piped/agent output stays plain.
+
+/// Issue IDs: bold cyan.
+fn id_style() -> Style {
+    Style::new().bold().fg_color(Some(AnsiColor::Cyan.into()))
+}
+
+/// State: green when resolved-ish, yellow when active, plain otherwise.
+fn state_style(s: &str) -> Style {
+    let l = s.to_ascii_lowercase();
+    let color = if [
+        "done", "fixed", "resolved", "verified", "closed", "complete",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+    {
+        AnsiColor::Green
+    } else if [
+        "open", "new", "progress", "backlog", "reopen", "to do", "wait",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+    {
+        AnsiColor::Yellow
+    } else {
+        return Style::new();
+    };
+    Style::new().fg_color(Some(color.into()))
+}
+
+/// Priority: red (bold for critical), dim for minor, plain otherwise.
+fn prio_style(s: &str) -> Style {
+    let l = s.to_ascii_lowercase();
+    if l.contains("critical") || l.contains("show") || l.contains("blocker") {
+        Style::new().bold().fg_color(Some(AnsiColor::Red.into()))
+    } else if l.contains("major") || l.contains("urgent") {
+        Style::new().fg_color(Some(AnsiColor::Red.into()))
+    } else if l.contains("minor") {
+        Style::new().dimmed()
+    } else {
+        Style::new()
+    }
+}
+
 fn stdin_text() -> Result<String> {
     let mut s = String::new();
     std::io::stdin().read_to_string(&mut s)?;
@@ -612,11 +659,14 @@ fn run() -> Result<()> {
                 return Ok(());
             }
             for i in &list {
-                println!(
-                    "{}  {}  {}  {}",
-                    i["idReadable"].as_str().unwrap_or("?"),
-                    cf_get(i, "State").as_deref().unwrap_or("-"),
-                    cf_get(i, "Priority").as_deref().unwrap_or("-"),
+                let id = i["idReadable"].as_str().unwrap_or("?");
+                let state = cf_get(i, "State");
+                let state = state.as_deref().unwrap_or("-");
+                let prio = cf_get(i, "Priority");
+                let prio = prio.as_deref().unwrap_or("-");
+                let (ids, ss, ps) = (id_style(), state_style(state), prio_style(prio));
+                anstream::println!(
+                    "{ids}{id}{ids:#}  {ss}{state}{ss:#}  {ps}{prio}{ps:#}  {}",
                     i["summary"].as_str().unwrap_or("")
                 );
                 if full {
@@ -634,8 +684,9 @@ fn run() -> Result<()> {
         }
         Cmd::Show { id, comments } => {
             let i = c.get(&format!("issues/{id}"), &[("fields", ISSUE_FIELDS)])?;
-            println!(
-                "{}  {}",
+            let ids = id_style();
+            anstream::println!(
+                "{ids}{}{ids:#}  {}",
                 i["idReadable"].as_str().unwrap_or(&id),
                 i["summary"].as_str().unwrap_or("")
             );
