@@ -54,10 +54,17 @@ legacy single-server `config.json` is read transparently as the `default` server
 yt ls "QUERY" [-n 20] [--full]        search; one line per issue: ID  STATE  PRIO  SUMMARY
 yt show ID [-c]                       issue detail; -c appends comments
 yt new PROJECT "SUMMARY" [-d DESC|-d -] [-f "Priority Critical"]...   prints new ID only
+yt edit ID [-s "SUMMARY"] [-d DESC|-d -]   edit summary/description; prints ID
 yt comment ID [TEXT]                  add comment (stdin if TEXT omitted)
 yt comments ID                        list comments
+yt attachments ID [-o DIR]            list attachments (NAME SIZE); -o downloads to DIR (default .)
+yt attach ID FILE... [-c COMMENT]     upload files to an issue (or a comment with -c); prints ID NAME
 yt cmd "COMMAND" ID... [-m COMMENT]   apply command: state, assignee, tags, ...
+yt tags                               list tags (one name per line)
+yt tag ID TAG                         add a tag (by name) to an issue
+yt untag ID TAG                       remove a tag (by name) from an issue
 yt projects                           list projects (SHORT  NAME)
+yt project new SHORT NAME              create a project (prints SHORT  ID); needs an admin token
 yt fields PROJECT                     fields + allowed values (falls back to observed
                                       values when the token lacks project-admin rights)
 yt me / yt users QUERY                user info
@@ -70,6 +77,12 @@ yt default NAME                       set the default server
 
 `-f` on `new` uses YouTrack command syntax and is applied right after creation
 (`-f "Priority Critical" -f "Type Bug"`).
+
+`yt project new` requires a token with **admin permissions** (it POSTs to
+`/api/admin/projects`); a non-admin token returns `HTTP 403` and the server's
+message is surfaced. The current user is set as project leader automatically.
+Creating or attaching project custom fields is likewise admin-only and is not
+implemented — use `yt fields PROJECT` to list a project's fields.
 
 ### Examples
 
@@ -91,8 +104,12 @@ Use the `yt` CLI for issue tracking (auth already configured):
 - `yt ls "project: DEMO #Unresolved sort by: updated desc" [-n N] [--full]` — search
 - `yt show DEMO-1 [-c]` — detail (+comments); `yt comments DEMO-1`
 - `yt new DEMO "summary" -d - [-f "Priority Critical"]` — create, desc from stdin, prints ID
+- `yt edit DEMO-1 -s "new summary" -d -` — edit summary/description (desc from stdin)
 - `yt comment DEMO-1 "text"` — comment
+- `yt attachments DEMO-1 [-o DIR]` — list attachments; `-o` downloads them (default cwd)
+- `yt attach DEMO-1 shot.png log.txt [-c 4-9]` — upload files to the issue (or comment `4-9`)
 - `yt cmd "State Done assignee me" DEMO-1 DEMO-2 [-m "note"]` — batch state/assign/etc.
+- `yt tags` — list tags; `yt tag DEMO-1 Blocked` / `yt untag DEMO-1 Blocked` — add/remove tag
 - `yt projects`, `yt fields DEMO`, `yt query-help` — discovery
 ```
 
