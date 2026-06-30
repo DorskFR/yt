@@ -8,6 +8,8 @@ use std::io::Read;
 const LIST_FIELDS: &str = "idReadable,summary,customFields(name,value(name,login,text))";
 const ISSUE_FIELDS: &str = "idReadable,summary,description,created,updated,reporter(login),customFields(name,value(name,login,text))";
 const COMMENT_FIELDS: &str = "created,text,author(login)";
+const LINK_FIELDS: &str =
+    "id,direction,linkType(name,sourceToTarget,targetToSource),issues(idReadable,summary)";
 
 #[derive(Parser)]
 #[command(
@@ -85,6 +87,21 @@ enum Cmd {
     Comment { id: String, text: Option<String> },
     /// List an issue's comments
     Comments { id: String },
+    /// List an issue's links to other issues, grouped by relation
+    Links { id: String },
+    /// Link two issues, e.g. yt link YT-1 "relates to" YT-2 (run `yt links <id>` for the phrases this server accepts)
+    Link {
+        id: String,
+        /// Relation phrase, e.g. "relates to", "depends on", "subtask of"
+        phrase: String,
+        target: String,
+    },
+    /// Remove a link between two issues (same phrase as `yt link`)
+    Unlink {
+        id: String,
+        phrase: String,
+        target: String,
+    },
     /// Apply a YouTrack command to issues, e.g. yt cmd "State Fixed assignee me" DEMO-1 DEMO-2
     #[allow(clippy::enum_variant_names)]
     Cmd {
@@ -581,6 +598,88 @@ fn print_comments(c: &Client, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The relation phrase to display for a link group, picked by its direction:
+/// outward (and the undirected "both") reads source→target, inward reads back.
+fn link_phrase(group: &Value) -> &str {
+    let lt = &group["linkType"];
+    match group["direction"].as_str() {
+        Some("INWARD") => lt["targetToSource"].as_str().unwrap_or(""),
+        _ => lt["sourceToTarget"].as_str().unwrap_or(""),
+    }
+}
+
+/// Fetch an issue's links, keeping only groups that actually contain issues.
+fn fetch_links(c: &Client, id: &str) -> Result<Vec<Value>> {
+    let links = c.get(&format!("issues/{id}/links"), &[("fields", LINK_FIELDS)])?;
+    Ok(links
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|g| g["issues"].as_array().is_some_and(|a| !a.is_empty()))
+        .cloned()
+        .collect())
+}
+
+/// Print link groups, one linked issue per line: `phrase  ID  summary`.
+fn print_link_groups(groups: &[Value]) {
+    let ids = id_style();
+    for g in groups {
+        let phrase = link_phrase(g);
+        for li in g["issues"].as_array().into_iter().flatten() {
+            anstream::println!(
+                "{phrase}  {ids}{}{ids:#}  {}",
+                li["idReadable"].as_str().unwrap_or("?"),
+                li["summary"].as_str().unwrap_or("")
+            );
+        }
+    }
+}
+
+/// Print an issue's links, one linked issue per line: `phrase  ID  summary`.
+fn print_links(c: &Client, id: &str) -> Result<()> {
+    let groups = fetch_links(c, id)?;
+    if groups.is_empty() {
+        println!("no links");
+        return Ok(());
+    }
+    print_link_groups(&groups);
+    Ok(())
+}
+
+/// Find the link-group id whose relation phrase matches `phrase`
+/// (case-insensitive). Lists the server's accepted phrases on a miss.
+fn resolve_link_group(c: &Client, id: &str, phrase: &str) -> Result<String> {
+    let links = c.get(&format!("issues/{id}/links"), &[("fields", LINK_FIELDS)])?;
+    let groups: Vec<Value> = links.as_array().cloned().unwrap_or_default();
+    if let Some(g) = groups
+        .iter()
+        .find(|g| link_phrase(g).eq_ignore_ascii_case(phrase))
+    {
+        return Ok(g["id"].as_str().unwrap_or_default().to_string());
+    }
+    let mut phrases: Vec<&str> = groups
+        .iter()
+        .map(link_phrase)
+        .filter(|p| !p.is_empty())
+        .collect();
+    phrases.sort_unstable();
+    phrases.dedup();
+    bail!(
+        "unknown link phrase {phrase:?}; this server accepts: {}",
+        phrases.join(", ")
+    )
+}
+
+/// Resolve an issue's readable id to its internal database id (needed to
+/// address a link's target on delete).
+fn internal_id(c: &Client, id: &str) -> Result<String> {
+    let i = c.get(&format!("issues/{id}"), &[("fields", "id")])?;
+    i["id"]
+        .as_str()
+        .map(String::from)
+        .with_context(|| format!("no such issue: {id}"))
+}
+
 const QUERY_HELP: &str = "YouTrack query syntax:
   project: DEMO              #Unresolved | #Resolved | #me (assigned to me)
   State: Open               State: -Done (negate)   State: {In Progress} (multiword -> braces)
@@ -926,6 +1025,11 @@ fn run() -> Result<()> {
             if let Some(d) = i["description"].as_str().filter(|d| !d.is_empty()) {
                 println!("\n{}", d.trim_end());
             }
+            let links = fetch_links(&c, i["idReadable"].as_str().unwrap_or(&id))?;
+            if !links.is_empty() {
+                println!("\n-- links --");
+                print_link_groups(&links);
+            }
             if comments {
                 println!("\n-- comments --");
                 print_comments(&c, i["idReadable"].as_str().unwrap_or(&id))?;
@@ -991,6 +1095,22 @@ fn run() -> Result<()> {
             println!("ok");
         }
         Cmd::Comments { id } => print_comments(&c, &id)?,
+        Cmd::Links { id } => print_links(&c, &id)?,
+        Cmd::Link { id, phrase, target } => {
+            let group = resolve_link_group(&c, &id, &phrase)?;
+            c.post(
+                &format!("issues/{id}/links/{group}/issues"),
+                &[("fields", "idReadable")],
+                json!({"idReadable": target}),
+            )?;
+            println!("{id} {phrase} {target}");
+        }
+        Cmd::Unlink { id, phrase, target } => {
+            let group = resolve_link_group(&c, &id, &phrase)?;
+            let tid = internal_id(&c, &target)?;
+            c.delete(&format!("issues/{id}/links/{group}/issues/{tid}"))?;
+            println!("{id} unlinked {target}");
+        }
         Cmd::Attachments { id, out } => {
             let atts = c.get(
                 &format!("issues/{id}/attachments"),
@@ -1426,6 +1546,17 @@ mod tests {
     fn date_non_number_is_dash() {
         assert_eq!(date(&json!(null)), "-");
         assert_eq!(date(&json!("nope")), "-");
+    }
+
+    #[test]
+    fn link_phrase_picks_direction() {
+        let lt = json!({"sourceToTarget": "is required for", "targetToSource": "depends on"});
+        let outward = json!({"direction": "OUTWARD", "linkType": lt});
+        let inward = json!({"direction": "INWARD", "linkType": lt});
+        let both = json!({"direction": "BOTH", "linkType": {"sourceToTarget": "relates to", "targetToSource": ""}});
+        assert_eq!(link_phrase(&outward), "is required for");
+        assert_eq!(link_phrase(&inward), "depends on");
+        assert_eq!(link_phrase(&both), "relates to");
     }
 
     #[test]
