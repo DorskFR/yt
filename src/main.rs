@@ -10,9 +10,11 @@ const ISSUE_FIELDS: &str = "idReadable,summary,description,created,updated,repor
 const COMMENT_FIELDS: &str = "created,text,author(login)";
 const LINK_FIELDS: &str =
     "id,direction,linkType(name,sourceToTarget,targetToSource),issues(idReadable,summary)";
-// PRs and commits share the vcsChanges collection; $type tells them apart and a
-// PullRequest's merge status lives on its state (PullRequestState: OPEN/MERGED/DECLINED).
-const VCS_FIELDS: &str = "$type,state(id,name),title,url";
+// Pull requests surface in the activity stream under PullRequestChangeCategory
+// (the vcsChanges collection only holds bare commits for the GitHub integration).
+// Each PullRequestChange carries a PullRequestState whose *id* is the enum value
+// OPEN / MERGED / DECLINED — note `name` comes back null, so match on `id`.
+const PR_ACTIVITY_FIELDS: &str = "added(state(id),url)";
 
 #[derive(Parser)]
 #[command(
@@ -576,36 +578,39 @@ fn resolve_tag(c: &Client, name: &str) -> Result<String> {
         .with_context(|| format!("tag not found: {name}"))
 }
 
-/// Extract pull requests from a vcsChanges array as (state, title, url),
-/// skipping plain commits (`$type: VcsChange`). The state is the
-/// PullRequestState name (OPEN/MERGED/DECLINED), "?" when absent. Pure.
-fn prs_from_changes(changes: &Value) -> Vec<(String, String, String)> {
-    changes
-        .as_array()
+/// Extract pull-request state changes (state, optional url) from a
+/// PullRequestChangeCategory activity payload, in chronological order. Each
+/// activity item's `added` holds PullRequestChange entries whose `state.id` is
+/// the PullRequestState (OPEN/MERGED/DECLINED). Pure.
+fn pr_changes_from_activities(acts: &Value) -> Vec<(String, Option<String>)> {
+    acts.as_array()
         .into_iter()
         .flatten()
-        .filter(|v| v["$type"].as_str() == Some("PullRequest"))
-        .map(|v| {
-            (
-                v["state"]["name"].as_str().unwrap_or("?").to_string(),
-                v["title"].as_str().unwrap_or("").to_string(),
-                v["url"].as_str().unwrap_or("").to_string(),
-            )
+        .flat_map(|item| item["added"].as_array().into_iter().flatten())
+        .filter_map(|ch| {
+            let state = ch["state"]["id"].as_str()?.to_string();
+            Some((state, ch["url"].as_str().map(String::from)))
         })
         .collect()
 }
 
-/// True when any pull request is MERGED (case-insensitive; casing isn't
-/// documented). DECLINED and OPEN do not count. Pure.
-fn has_merged_pr(prs: &[(String, String, String)]) -> bool {
-    prs.iter().any(|(s, _, _)| s.eq_ignore_ascii_case("merged"))
+/// True when any pull-request change reached MERGED (case-insensitive). OPEN and
+/// DECLINED do not count. Pure.
+fn has_merged_pr(changes: &[(String, Option<String>)]) -> bool {
+    changes.iter().any(|(s, _)| s.eq_ignore_ascii_case("merged"))
 }
 
-/// Fetch an issue's pull requests (from the vcsChanges collection) as
-/// (state, title, url) tuples. One small request; commits are filtered out.
-fn fetch_prs(c: &Client, id: &str) -> Result<Vec<(String, String, String)>> {
-    let changes = c.get(&format!("issues/{id}/vcsChanges"), &[("fields", VCS_FIELDS)])?;
-    Ok(prs_from_changes(&changes))
+/// Fetch an issue's pull-request state changes from the activity stream, as
+/// (state, optional url) tuples. One small request scoped to the PR category.
+fn fetch_pr_changes(c: &Client, id: &str) -> Result<Vec<(String, Option<String>)>> {
+    let acts = c.get(
+        &format!("issues/{id}/activities"),
+        &[
+            ("categories", "PullRequestChangeCategory"),
+            ("fields", PR_ACTIVITY_FIELDS),
+        ],
+    )?;
+    Ok(pr_changes_from_activities(&acts))
 }
 
 fn issue_ref(id: &str) -> Value {
@@ -1014,7 +1019,7 @@ fn run() -> Result<()> {
                 let mut kept = Vec::new();
                 for i in &fetched {
                     let id = i["idReadable"].as_str().unwrap_or_default();
-                    if has_merged_pr(&fetch_prs(&c, id)?) {
+                    if has_merged_pr(&fetch_pr_changes(&c, id)?) {
                         kept.push(i.clone());
                     }
                 }
@@ -1092,14 +1097,14 @@ fn run() -> Result<()> {
                 print_link_groups(&links);
             }
             if pr {
-                let prs = fetch_prs(&c, i["idReadable"].as_str().unwrap_or(&id))?;
+                let prs = fetch_pr_changes(&c, i["idReadable"].as_str().unwrap_or(&id))?;
                 println!("\n-- pull requests --");
                 if prs.is_empty() {
                     println!("no pull requests");
                 }
-                for (state, title, url) in &prs {
+                for (state, url) in &prs {
                     let ss = state_style(state);
-                    anstream::println!("{ss}{state}{ss:#}  {title}  {url}");
+                    anstream::println!("{ss}{state}{ss:#}  {}", url.as_deref().unwrap_or(""));
                 }
             }
             if comments {
@@ -1696,44 +1701,42 @@ mod tests {
     // ---- pull-request extraction ----
 
     #[test]
-    fn prs_from_changes_skips_commits() {
-        let changes = json!([
-            {"$type": "VcsChange", "state": 0, "title": "fix: a commit"},
-            {"$type": "PullRequest", "state": {"name": "MERGED"}, "title": "feat: x", "url": "https://gh/pr/1"},
-            {"$type": "PullRequest", "state": {"name": "OPEN"}, "title": "wip", "url": "https://gh/pr/2"},
+    fn pr_changes_from_activities_reads_state_id() {
+        // shape mirrors a live PullRequestChangeCategory response: state on
+        // `state.id` (name is null), wrapped in each item's `added` array.
+        let acts = json!([
+            {"$type": "PullRequestChangeActivityItem",
+             "added": [{"$type": "PullRequestChange", "state": {"id": "OPEN"}}]},
+            {"$type": "PullRequestChangeActivityItem",
+             "added": [{"$type": "PullRequestChange", "state": {"id": "MERGED"}, "url": "https://gh/pr/1"}]},
         ]);
-        let prs = prs_from_changes(&changes);
-        assert_eq!(prs.len(), 2);
-        assert_eq!(prs[0], ("MERGED".into(), "feat: x".into(), "https://gh/pr/1".into()));
-        assert_eq!(prs[1].0, "OPEN");
+        let changes = pr_changes_from_activities(&acts);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0], ("OPEN".into(), None));
+        assert_eq!(changes[1], ("MERGED".into(), Some("https://gh/pr/1".into())));
     }
 
     #[test]
-    fn prs_from_changes_handles_missing_fields() {
-        // a PR with no state/title/url still yields a tuple with placeholders
-        let changes = json!([{"$type": "PullRequest"}]);
-        let prs = prs_from_changes(&changes);
-        assert_eq!(prs, vec![("?".into(), String::new(), String::new())]);
-    }
-
-    #[test]
-    fn prs_from_changes_empty_and_non_array() {
-        assert!(prs_from_changes(&json!([])).is_empty());
-        assert!(prs_from_changes(&json!(null)).is_empty());
+    fn pr_changes_from_activities_skips_stateless_and_non_array() {
+        // an added entry without a state id is skipped; non-array inputs yield empty
+        let acts = json!([{"added": [{"$type": "PullRequestChange"}]}]);
+        assert!(pr_changes_from_activities(&acts).is_empty());
+        assert!(pr_changes_from_activities(&json!([])).is_empty());
+        assert!(pr_changes_from_activities(&json!(null)).is_empty());
     }
 
     #[test]
     fn has_merged_pr_matches_merged_case_insensitively() {
-        let merged = vec![("merged".into(), String::new(), String::new())];
-        let open = vec![("OPEN".into(), String::new(), String::new())];
-        let declined = vec![("DECLINED".into(), String::new(), String::new())];
+        let merged = vec![("merged".to_string(), None)];
+        let open = vec![("OPEN".to_string(), None)];
+        let declined = vec![("DECLINED".to_string(), None)];
         assert!(has_merged_pr(&merged));
         // not-merged states (incl. DECLINED) must not count
         assert!(!has_merged_pr(&open));
         assert!(!has_merged_pr(&declined));
         assert!(!has_merged_pr(&[]));
-        // any merged PR in the set is enough
-        assert!(has_merged_pr(&[open[0].clone(), ("MERGED".into(), String::new(), String::new())]));
+        // a PR that went OPEN -> MERGED still counts
+        assert!(has_merged_pr(&[open[0].clone(), ("MERGED".to_string(), None)]));
     }
 
     // ---- self-update helpers ----
