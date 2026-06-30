@@ -51,7 +51,7 @@ enum Cmd {
         /// Description ("-" reads stdin)
         #[arg(short, long)]
         desc: Option<String>,
-        /// Field assignment in command syntax, repeatable: -f "Priority Critical" -f "Type Bug"
+        /// Field assignment in command syntax, repeatable, e.g. -f "Priority Critical" -f "State In Progress" (field names vary by project — see `yt fields <PROJECT>`)
         #[arg(short, long)]
         field: Vec<String>,
     },
