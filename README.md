@@ -74,6 +74,9 @@ yt new PROJECT "SUMMARY" [-d DESC|-d -] [-f "Priority Critical"]...   prints new
 yt edit ID [-s "SUMMARY"] [-d DESC|-d -]   edit summary/description; prints ID
 yt comment ID [TEXT]                  add comment (stdin if TEXT omitted)
 yt comments ID                        list comments
+yt links ID                           list links (PHRASE  ID  SUMMARY), grouped by relation
+yt link ID "PHRASE" TARGET            link two issues, e.g. yt link YT-1 "relates to" YT-2
+yt unlink ID "PHRASE" TARGET          remove a link (same phrase)
 yt attachments ID [-o DIR]            list attachments (NAME SIZE); -o downloads to DIR (default .)
 yt attach ID FILE... [-c COMMENT]     upload files to an issue (or a comment with -c); prints ID NAME
 yt cmd "COMMAND" ID... [-m COMMENT]   apply command: state, assignee, tags, ...
@@ -160,6 +163,7 @@ Use the `yt` CLI for issue tracking (auth already configured):
 - `yt new DEMO "summary" -d - [-f "Priority Critical"]` — create, desc from stdin, prints ID
 - `yt edit DEMO-1 -s "new summary" -d -` — edit summary/description (desc from stdin)
 - `yt comment DEMO-1 "text"` — comment
+- `yt links DEMO-1`, `yt link DEMO-1 "relates to" DEMO-2`, `yt unlink DEMO-1 "depends on" DEMO-3` — issue relations
 - `yt attachments DEMO-1 [-o DIR]` — list attachments; `-o` downloads them (default cwd)
 - `yt attach DEMO-1 shot.png log.txt [-c 4-9]` — upload files to the issue (or comment `4-9`)
 - `yt cmd "State Done assignee me" DEMO-1 DEMO-2 [-m "note"]` — batch state/assign/etc.
