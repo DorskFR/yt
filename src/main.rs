@@ -10,6 +10,9 @@ const ISSUE_FIELDS: &str = "idReadable,summary,description,created,updated,repor
 const COMMENT_FIELDS: &str = "created,text,author(login)";
 const LINK_FIELDS: &str =
     "id,direction,linkType(name,sourceToTarget,targetToSource),issues(idReadable,summary)";
+// PRs and commits share the vcsChanges collection; $type tells them apart and a
+// PullRequest's merge status lives on its state (PullRequestState: OPEN/MERGED/DECLINED).
+const VCS_FIELDS: &str = "$type,state(id,name),title,url";
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +40,10 @@ enum Cmd {
         /// Include descriptions
         #[arg(long)]
         full: bool,
+        /// Keep only issues referenced in a MERGED pull request (one extra API
+        /// call per result row — opt-in; pair with -n to bound the fan-out)
+        #[arg(long)]
+        merged_pr: bool,
     },
     /// Show one issue
     Show {
@@ -44,6 +51,9 @@ enum Cmd {
         /// Include comments
         #[arg(short, long)]
         comments: bool,
+        /// Include linked pull requests (state, title, url)
+        #[arg(long)]
+        pr: bool,
     },
     /// Create an issue; prints the new ID only
     New {
@@ -566,6 +576,38 @@ fn resolve_tag(c: &Client, name: &str) -> Result<String> {
         .with_context(|| format!("tag not found: {name}"))
 }
 
+/// Extract pull requests from a vcsChanges array as (state, title, url),
+/// skipping plain commits (`$type: VcsChange`). The state is the
+/// PullRequestState name (OPEN/MERGED/DECLINED), "?" when absent. Pure.
+fn prs_from_changes(changes: &Value) -> Vec<(String, String, String)> {
+    changes
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|v| v["$type"].as_str() == Some("PullRequest"))
+        .map(|v| {
+            (
+                v["state"]["name"].as_str().unwrap_or("?").to_string(),
+                v["title"].as_str().unwrap_or("").to_string(),
+                v["url"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// True when any pull request is MERGED (case-insensitive; casing isn't
+/// documented). DECLINED and OPEN do not count. Pure.
+fn has_merged_pr(prs: &[(String, String, String)]) -> bool {
+    prs.iter().any(|(s, _, _)| s.eq_ignore_ascii_case("merged"))
+}
+
+/// Fetch an issue's pull requests (from the vcsChanges collection) as
+/// (state, title, url) tuples. One small request; commits are filtered out.
+fn fetch_prs(c: &Client, id: &str) -> Result<Vec<(String, String, String)>> {
+    let changes = c.get(&format!("issues/{id}/vcsChanges"), &[("fields", VCS_FIELDS)])?;
+    Ok(prs_from_changes(&changes))
+}
+
 fn issue_ref(id: &str) -> Value {
     // internal ids look like "2-123"; anything else is treated as readable (DEMO-1)
     let internal = id.split_once('-').is_some_and(|(a, b)| {
@@ -946,7 +988,12 @@ fn run() -> Result<()> {
     let c = Client::resolve(cli.server.as_deref())?;
 
     match cli.cmd {
-        Cmd::Ls { query, limit, full } => {
+        Cmd::Ls {
+            query,
+            limit,
+            full,
+            merged_pr,
+        } => {
             let fields = if full {
                 format!("{LIST_FIELDS},description")
             } else {
@@ -960,7 +1007,21 @@ fn run() -> Result<()> {
                     ("$top", &limit.to_string()),
                 ],
             )?;
-            let list = issues.as_array().cloned().unwrap_or_default();
+            let fetched = issues.as_array().cloned().unwrap_or_default();
+            // --merged-pr post-filters the page with one vcsChanges call per row.
+            // It filters *after* $top, so -n caps API calls, not surviving rows.
+            let list: Vec<Value> = if merged_pr {
+                let mut kept = Vec::new();
+                for i in &fetched {
+                    let id = i["idReadable"].as_str().unwrap_or_default();
+                    if has_merged_pr(&fetch_prs(&c, id)?) {
+                        kept.push(i.clone());
+                    }
+                }
+                kept
+            } else {
+                fetched.clone()
+            };
             if list.is_empty() {
                 println!("no matches");
                 return Ok(());
@@ -985,11 +1046,11 @@ fn run() -> Result<()> {
                     }
                 }
             }
-            if list.len() == limit {
+            if fetched.len() == limit {
                 println!("# limit {limit} reached; refine query or raise -n");
             }
         }
-        Cmd::Show { id, comments } => {
+        Cmd::Show { id, comments, pr } => {
             let i = c.get(&format!("issues/{id}"), &[("fields", ISSUE_FIELDS)])?;
             let ids = id_style();
             anstream::println!(
@@ -1029,6 +1090,17 @@ fn run() -> Result<()> {
             if !links.is_empty() {
                 println!("\n-- links --");
                 print_link_groups(&links);
+            }
+            if pr {
+                let prs = fetch_prs(&c, i["idReadable"].as_str().unwrap_or(&id))?;
+                println!("\n-- pull requests --");
+                if prs.is_empty() {
+                    println!("no pull requests");
+                }
+                for (state, title, url) in &prs {
+                    let ss = state_style(state);
+                    anstream::println!("{ss}{state}{ss:#}  {title}  {url}");
+                }
             }
             if comments {
                 println!("\n-- comments --");
@@ -1619,6 +1691,49 @@ mod tests {
         assert_eq!(issue_ref("2-123"), json!({"id": "2-123"}));
         // readable ids (project-prefixed) use idReadable
         assert_eq!(issue_ref("DEMO-1"), json!({"idReadable": "DEMO-1"}));
+    }
+
+    // ---- pull-request extraction ----
+
+    #[test]
+    fn prs_from_changes_skips_commits() {
+        let changes = json!([
+            {"$type": "VcsChange", "state": 0, "title": "fix: a commit"},
+            {"$type": "PullRequest", "state": {"name": "MERGED"}, "title": "feat: x", "url": "https://gh/pr/1"},
+            {"$type": "PullRequest", "state": {"name": "OPEN"}, "title": "wip", "url": "https://gh/pr/2"},
+        ]);
+        let prs = prs_from_changes(&changes);
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0], ("MERGED".into(), "feat: x".into(), "https://gh/pr/1".into()));
+        assert_eq!(prs[1].0, "OPEN");
+    }
+
+    #[test]
+    fn prs_from_changes_handles_missing_fields() {
+        // a PR with no state/title/url still yields a tuple with placeholders
+        let changes = json!([{"$type": "PullRequest"}]);
+        let prs = prs_from_changes(&changes);
+        assert_eq!(prs, vec![("?".into(), String::new(), String::new())]);
+    }
+
+    #[test]
+    fn prs_from_changes_empty_and_non_array() {
+        assert!(prs_from_changes(&json!([])).is_empty());
+        assert!(prs_from_changes(&json!(null)).is_empty());
+    }
+
+    #[test]
+    fn has_merged_pr_matches_merged_case_insensitively() {
+        let merged = vec![("merged".into(), String::new(), String::new())];
+        let open = vec![("OPEN".into(), String::new(), String::new())];
+        let declined = vec![("DECLINED".into(), String::new(), String::new())];
+        assert!(has_merged_pr(&merged));
+        // not-merged states (incl. DECLINED) must not count
+        assert!(!has_merged_pr(&open));
+        assert!(!has_merged_pr(&declined));
+        assert!(!has_merged_pr(&[]));
+        // any merged PR in the set is enough
+        assert!(has_merged_pr(&[open[0].clone(), ("MERGED".into(), String::new(), String::new())]));
     }
 
     // ---- self-update helpers ----
