@@ -137,6 +137,12 @@ enum Cmd {
         /// Target shell
         shell: Shell,
     },
+    /// Update yt to the latest release (downloads from GitHub, verifies sha256)
+    Update {
+        /// Reinstall the latest even if already up to date
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -588,6 +594,196 @@ Examples:
   yt ls \"project: DEMO State: -Done assignee: me\"
   yt cmd \"State {In Progress} assignee me\" DEMO-12";
 
+// --- self-update / update notice -----------------------------------------
+
+const REPO: &str = "DorskFR/yt";
+const UPDATE_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// Parse a `MAJOR.MINOR.PATCH` (optionally `v`-prefixed) version into a tuple
+/// for ordering. Trailing pre-release/build metadata is ignored. Pure.
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let v = v.trim().trim_start_matches('v');
+    // drop any -prerelease/+build suffix
+    let core = v.split(['-', '+']).next().unwrap_or(v);
+    let mut it = core.split('.');
+    let maj = it.next()?.parse().ok()?;
+    let min = it.next().unwrap_or("0").parse().ok()?;
+    let pat = it.next().unwrap_or("0").parse().ok()?;
+    Some((maj, min, pat))
+}
+
+/// Is `latest` strictly newer than `current`? Unparseable versions => false. Pure.
+fn is_newer(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
+}
+
+/// GitHub release-asset name for the host platform, e.g. `yt-linux-amd64`.
+/// None on unsupported os/arch. Pure (reads compile-time consts).
+fn asset_name() -> Option<&'static str> {
+    Some(match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "yt-linux-amd64",
+        ("linux", "aarch64") => "yt-linux-arm64",
+        ("macos", "aarch64") => "yt-darwin-arm64",
+        ("macos", "x86_64") => "yt-darwin-amd64",
+        _ => return None,
+    })
+}
+
+fn update_cache_path() -> std::path::PathBuf {
+    config_path().with_file_name("update-check.json")
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Query GitHub for the latest release; returns (tag, version-without-v).
+/// Time-boxed; any failure is an error the caller can swallow.
+fn fetch_latest_release() -> Result<(String, String)> {
+    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let res = ureq::get(&url)
+        .set("User-Agent", &format!("yt/{}", env!("CARGO_PKG_VERSION")))
+        .set("Accept", "application/vnd.github+json")
+        .timeout(std::time::Duration::from_secs(4))
+        .call();
+    let v = read(res)?;
+    let tag = v["tag_name"]
+        .as_str()
+        .context("release has no tag_name")?
+        .to_string();
+    let version = tag.trim_start_matches('v').to_string();
+    Ok((tag, version))
+}
+
+/// Best-effort: print a one-line notice to stderr when a newer release exists.
+/// Uses a cached check (refreshed at most once per interval) so most runs do no
+/// network IO. Silent on any failure, when opted out, or when not a TTY.
+fn maybe_print_update_notice() {
+    if std::env::var_os("YT_NO_UPDATE_CHECK").is_some() {
+        return;
+    }
+    // Only nag interactive users; never pollute piped/agent output.
+    use std::io::IsTerminal;
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    let current = env!("CARGO_PKG_VERSION");
+    let path = update_cache_path();
+    let cached: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(Value::Null);
+    let checked_at = cached["checked_at"].as_u64().unwrap_or(0);
+    let mut latest = cached["latest"].as_str().unwrap_or("").to_string();
+
+    if now_secs().saturating_sub(checked_at) >= UPDATE_CHECK_INTERVAL_SECS {
+        // stale (or absent): refresh in the foreground but time-boxed.
+        if let Ok((_, v)) = fetch_latest_release() {
+            latest = v.clone();
+            let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+            let _ = std::fs::write(
+                &path,
+                serde_json::to_string(&json!({"checked_at": now_secs(), "latest": v}))
+                    .unwrap_or_default(),
+            );
+        }
+    }
+
+    if !latest.is_empty() && is_newer(&latest, current) {
+        eprintln!("update available: {current} -> {latest} (run: yt update)");
+    }
+}
+
+/// Download the latest release binary for this platform, verify its sha256
+/// against the release `SHA256SUMS`, and atomically replace the running exe.
+fn self_update(force: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let asset = asset_name().with_context(|| {
+        format!(
+            "unsupported platform: {}/{} (no prebuilt binary)",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+    let (tag, latest) = fetch_latest_release()?;
+    if !force && !is_newer(&latest, current) {
+        println!("already up to date ({current})");
+        return Ok(());
+    }
+
+    let base = format!("https://github.com/{REPO}/releases/download/{tag}");
+    let ua = format!("yt/{current}");
+
+    // Fetch the checksums file and find the line for our asset.
+    let sums = ureq::get(&format!("{base}/SHA256SUMS"))
+        .set("User-Agent", &ua)
+        .timeout(std::time::Duration::from_secs(30))
+        .call();
+    let sums = match sums {
+        Ok(r) => r.into_string()?,
+        Err(e) => bail!("fetching SHA256SUMS: {e}"),
+    };
+    let want = sums
+        .lines()
+        .find_map(|l| {
+            let (hash, name) = l.split_once(char::is_whitespace)?;
+            name.trim().ends_with(asset).then(|| hash.to_string())
+        })
+        .with_context(|| format!("no checksum for {asset} in SHA256SUMS"))?;
+
+    // Download the binary into memory and verify before touching disk.
+    eprintln!("downloading {asset} {latest}...");
+    let bytes = {
+        let res = ureq::get(&format!("{base}/{asset}"))
+            .set("User-Agent", &ua)
+            .timeout(std::time::Duration::from_secs(120))
+            .call();
+        match res {
+            Ok(r) => {
+                let mut buf = Vec::new();
+                r.into_reader().read_to_end(&mut buf)?;
+                buf
+            }
+            Err(e) => bail!("downloading {asset}: {e}"),
+        }
+    };
+
+    use sha2::{Digest, Sha256};
+    let got = format!("{:x}", Sha256::digest(&bytes));
+    if !got.eq_ignore_ascii_case(&want) {
+        bail!("checksum mismatch for {asset}: expected {want}, got {got} (aborting, binary untouched)");
+    }
+
+    // Atomic-ish replace: write next to the current exe, then rename over it.
+    // rename(2) swaps the inode, so a running process keeps its old text pages.
+    let exe = std::env::current_exe().context("cannot locate current executable")?;
+    let dir = exe.parent().context("executable has no parent dir")?;
+    let tmp = dir.join(format!(".yt-update-{}", std::process::id()));
+    std::fs::write(&tmp, &bytes).with_context(|| {
+        format!(
+            "cannot write to {} — is the install dir writable? (try with appropriate permissions)",
+            dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &exe) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("replacing {}", exe.display()));
+    }
+    println!("updated {current} -> {latest}");
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     if let Cmd::Completions { shell } = cli.cmd {
@@ -599,6 +795,9 @@ fn run() -> Result<()> {
     if let Cmd::QueryHelp = cli.cmd {
         println!("{QUERY_HELP}");
         return Ok(());
+    }
+    if let Cmd::Update { force } = cli.cmd {
+        return self_update(force);
     }
     if let Cmd::Auth { url, token, name } = &cli.cmd {
         let token = if token == "-" {
@@ -1007,8 +1206,10 @@ fn run() -> Result<()> {
         | Cmd::Auth { .. }
         | Cmd::Servers
         | Cmd::Default { .. }
-        | Cmd::Completions { .. } => unreachable!(),
+        | Cmd::Completions { .. }
+        | Cmd::Update { .. } => unreachable!(),
     }
+    maybe_print_update_notice();
     Ok(())
 }
 
@@ -1287,6 +1488,30 @@ mod tests {
         assert_eq!(issue_ref("2-123"), json!({"id": "2-123"}));
         // readable ids (project-prefixed) use idReadable
         assert_eq!(issue_ref("DEMO-1"), json!({"idReadable": "DEMO-1"}));
+    }
+
+    // ---- self-update helpers ----
+
+    #[test]
+    fn parse_version_handles_prefix_and_suffix() {
+        assert_eq!(parse_version("v0.6.1"), Some((0, 6, 1)));
+        assert_eq!(parse_version("0.6.1"), Some((0, 6, 1)));
+        assert_eq!(parse_version("1.2.3-rc1"), Some((1, 2, 3)));
+        assert_eq!(parse_version("2.0"), Some((2, 0, 0)));
+        assert_eq!(parse_version("nope"), None);
+    }
+
+    #[test]
+    fn is_newer_compares_semver() {
+        assert!(is_newer("0.7.0", "0.6.1"));
+        assert!(is_newer("0.6.2", "0.6.1"));
+        assert!(is_newer("1.0.0", "0.9.9"));
+        assert!(!is_newer("0.6.1", "0.6.1"));
+        assert!(!is_newer("0.6.0", "0.6.1"));
+        // v-prefix tolerated on either side
+        assert!(is_newer("v0.7.0", "0.6.1"));
+        // unparseable => not newer (fail safe)
+        assert!(!is_newer("garbage", "0.6.1"));
     }
 
     #[test]

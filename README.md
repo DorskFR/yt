@@ -22,6 +22,23 @@ cargo install --git https://github.com/DorskFR/yt
 # or: cargo build --release && install -m755 target/release/yt ~/.local/bin/
 ```
 
+## Updating
+
+```sh
+yt update            # download the latest release, verify sha256, replace in place
+yt update --force    # reinstall the latest even if already current
+```
+
+`yt update` picks the right prebuilt binary for your OS/arch (Linux and macOS,
+amd64/arm64), checks its sha256 against the release `SHA256SUMS` before
+installing, and replaces the running binary via an atomic rename (so the install
+dir just needs to be writable).
+
+When stderr is a terminal, `yt` also prints a one-line `update available: …`
+notice on a newer release. The check hits GitHub at most once every 24h (result
+cached in `~/.config/yt/update-check.json`) and is silent on failure. Set
+`YT_NO_UPDATE_CHECK=1` to disable it.
+
 ## Setup
 
 Save credentials once (written to `~/.config/yt/config.json`, mode 600):
