@@ -330,15 +330,27 @@ impl Client {
         self.base.strip_suffix("/api").unwrap_or(&self.base)
     }
 
+    /// Scheme + host origin (no path), e.g. https://yt.example.com. The base may
+    /// carry a path prefix (e.g. .../youtrack/api); attachment `url` fields are
+    /// relative to the domain root and already include that prefix.
+    fn origin(&self) -> &str {
+        let after_scheme = self.base.find("://").map_or(0, |i| i + 3);
+        match self.base[after_scheme..].find('/') {
+            Some(slash) => &self.base[..after_scheme + slash],
+            None => &self.base,
+        }
+    }
+
     /// Browser URL for an issue, e.g. https://yt.example.com/issue/YT-1.
     fn web_url(&self, id: &str) -> String {
         format!("{}/issue/{}", self.host(), id)
     }
 
-    /// Fetch raw bytes from a server-relative URL (the attachment `url` field is
-    /// relative to the host root, e.g. "/api/files/..."), with the auth header.
+    /// Fetch raw bytes from a root-relative URL (the attachment `url` field is
+    /// relative to the domain origin and already includes any path prefix, e.g.
+    /// "/youtrack/api/files/..."), with the auth header.
     fn get_bytes(&self, rel_url: &str) -> Result<Vec<u8>> {
-        let url = format!("{}{rel_url}", self.host());
+        let url = format!("{}{rel_url}", self.origin());
         let res = ureq::get(&url)
             .set("Authorization", &format!("Bearer {}", self.token))
             .call();
