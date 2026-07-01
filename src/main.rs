@@ -609,7 +609,9 @@ fn pr_changes_from_activities(acts: &Value) -> Vec<(String, Option<String>)> {
 /// True when any pull-request change reached MERGED (case-insensitive). OPEN and
 /// DECLINED do not count. Pure.
 fn has_merged_pr(changes: &[(String, Option<String>)]) -> bool {
-    changes.iter().any(|(s, _)| s.eq_ignore_ascii_case("merged"))
+    changes
+        .iter()
+        .any(|(s, _)| s.eq_ignore_ascii_case("merged"))
 }
 
 /// Fetch an issue's pull-request state changes from the activity stream, as
@@ -1725,7 +1727,10 @@ mod tests {
         let changes = pr_changes_from_activities(&acts);
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0], ("OPEN".into(), None));
-        assert_eq!(changes[1], ("MERGED".into(), Some("https://gh/pr/1".into())));
+        assert_eq!(
+            changes[1],
+            ("MERGED".into(), Some("https://gh/pr/1".into()))
+        );
     }
 
     #[test]
@@ -1748,7 +1753,10 @@ mod tests {
         assert!(!has_merged_pr(&declined));
         assert!(!has_merged_pr(&[]));
         // a PR that went OPEN -> MERGED still counts
-        assert!(has_merged_pr(&[open[0].clone(), ("MERGED".to_string(), None)]));
+        assert!(has_merged_pr(&[
+            open[0].clone(),
+            ("MERGED".to_string(), None)
+        ]));
     }
 
     // ---- self-update helpers ----
