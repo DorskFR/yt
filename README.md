@@ -25,11 +25,11 @@ cargo install --git https://github.com/DorskFR/yt
 ## Updating
 
 ```sh
-yt update            # download the latest release, verify sha256, replace in place
-yt update --force    # reinstall the latest even if already current
+yt write update            # download the latest release, verify sha256, replace in place
+yt write update --force    # reinstall the latest even if already current
 ```
 
-`yt update` picks the right prebuilt binary for your OS/arch (Linux and macOS,
+`yt write update` picks the right prebuilt binary for your OS/arch (Linux and macOS,
 amd64/arm64), checks its sha256 against the release `SHA256SUMS` before
 installing, and replaces the running binary via an atomic rename (so the install
 dir just needs to be writable).
@@ -39,12 +39,17 @@ notice on a newer release. The check hits GitHub at most once every 24h (result
 cached in `~/.config/yt/update-check.json`) and is silent on failure. Set
 `YT_NO_UPDATE_CHECK=1` to disable it.
 
+The command tree is split into two permission tiers — `yt read …` (never
+mutates anything) and `yt write …` (issues, projects, local config, self-update)
+— so an access guard can gate the whole CLI on two stable prefixes. Each tier is
+`tier → noun → verb`, e.g. `yt read issue ls`, `yt write issue comment`.
+
 ## Setup
 
 Save credentials once (written to `~/.config/yt/config.json`, mode 600):
 
 ```sh
-yt auth https://youtrack.example.com perm-...   # token "-" reads stdin
+yt write server auth https://youtrack.example.com perm-...   # token "-" reads stdin
 ```
 
 ### Multiple servers
@@ -52,11 +57,11 @@ yt auth https://youtrack.example.com perm-...   # token "-" reads stdin
 Credentials are keyed by server name, so one config can hold several instances:
 
 ```sh
-yt auth https://yt.example.com perm-...          # no name -> "default" (first added becomes default)
-yt auth https://yt.acme.com perm-... acme        # named server
-yt servers                                       # list servers (* marks the default)
-yt default acme                                  # change the default
-yt --server acme ls "project: ACME #Unresolved"  # one-off override for any command
+yt write server auth https://yt.example.com perm-...      # no name -> "default" (first added becomes default)
+yt write server auth https://yt.acme.com perm-... acme    # named server
+yt read server ls                                         # list servers (* marks the default)
+yt write server default acme                              # change the default
+yt --server acme read issue ls "project: ACME #Unresolved"  # one-off override for any command
 ```
 
 Resolution order for every command: `YOUTRACK_URL`/`YOUTRACK_API_TOKEN` env vars
@@ -68,32 +73,38 @@ legacy single-server `config.json` is read transparently as the `default` server
 ## Usage
 
 ```
-yt ls "QUERY" [-n 20] [--full]        search; one line per issue: ID  STATE  PRIO  SUMMARY
-yt show ID [-c]                       issue detail; -c appends comments
-yt new PROJECT "SUMMARY" [-d DESC|-d -] [-f "Priority Critical"]...   prints new ID only
-yt edit ID [-s "SUMMARY"] [-d DESC|-d -]   edit summary/description; prints ID
-yt comment ID [TEXT]                  add comment (stdin if TEXT omitted)
-yt comments ID                        list comments
-yt links ID                           list links (PHRASE  ID  SUMMARY), grouped by relation
-yt link ID "PHRASE" TARGET            link two issues, e.g. yt link YT-1 "relates to" YT-2
-yt unlink ID "PHRASE" TARGET          remove a link (same phrase)
-yt attachments ID [-o DIR]            list attachments (NAME SIZE); -o downloads to DIR (default .)
-yt attach ID FILE... [-c COMMENT]     upload files to an issue (or a comment with -c); prints ID NAME
-yt cmd "COMMAND" ID... [-m COMMENT]   apply command: state, assignee, tags, ...
-yt tags                               list tags (one name per line)
-yt tag ID TAG                         add a tag (by name) to an issue
-yt untag ID TAG                       remove a tag (by name) from an issue
-yt projects                           list projects (SHORT  NAME)
-yt project new SHORT NAME              create a project (prints SHORT  ID); needs an admin token
-yt fields PROJECT                     fields + allowed values (falls back to observed
-                                      values when the token lacks project-admin rights)
-yt me / yt users QUERY                user info
-yt query-help                         query syntax cheat sheet
-yt auth URL TOKEN [NAME]              save credentials (NAME defaults to "default")
-yt servers                            list configured servers (* marks the default)
-yt default NAME                       set the default server
-yt completions SHELL                  print a completion script (bash|zsh|fish|powershell|elvish)
---server NAME                         (global) use a named server for any command
+# read tier — never mutates
+yt read issue ls "QUERY" [-n 20] [--full]   search; one line per issue: ID  STATE  PRIO  SUMMARY
+yt read issue show ID [-c] [--pr]           issue detail; -c appends comments, --pr linked PRs
+yt read issue comments ID                   list comments
+yt read issue links ID                      list links (PHRASE  ID  SUMMARY), grouped by relation
+yt read issue attachments ID [-o DIR]       list attachments (NAME SIZE); -o downloads to DIR (default .)
+yt read issue tags                          list tags (one name per line)
+yt read project ls                          list projects (SHORT  NAME)
+yt read project fields PROJECT              fields + allowed values (falls back to observed
+                                            values when the token lacks project-admin rights)
+yt read user me                             authenticated user
+yt read user ls QUERY                       search users by name/login
+yt read server ls                           list configured servers (* marks the default)
+yt read query-help                          query syntax cheat sheet
+
+# write tier — mutates issues / projects / local config / the binary
+yt write issue new PROJECT "SUMMARY" [-d DESC|-d -] [-f "Priority Critical"]...  prints new ID only
+yt write issue edit ID [-s "SUMMARY"] [-d DESC|-d -]   edit summary/description; prints ID
+yt write issue comment ID [TEXT]            add comment (stdin if TEXT omitted)
+yt write issue link ID "PHRASE" TARGET      link two issues, e.g. yt write issue link YT-1 "relates to" YT-2
+yt write issue unlink ID "PHRASE" TARGET    remove a link (same phrase)
+yt write issue attach ID FILE... [-c COMMENT]  upload files to an issue (or a comment with -c); prints ID NAME
+yt write issue cmd "COMMAND" ID... [-m COMMENT]  apply command: state, assignee, tags, ...
+yt write issue tag ID TAG                   add a tag (by name) to an issue
+yt write issue untag ID TAG                 remove a tag (by name) from an issue
+yt write project create SHORT NAME          create a project (prints SHORT  ID); needs an admin token
+yt write server auth URL TOKEN [NAME]       save credentials (NAME defaults to "default")
+yt write server default NAME                set the default server
+yt write update [--force]                   self-update to the latest release
+
+yt completions SHELL                        print a completion script (bash|zsh|fish|powershell|elvish)
+--server NAME                               (global) use a named server for any command
 ```
 
 ### Shell completions
@@ -124,30 +135,30 @@ Re-run the command after upgrading `yt` to refresh completions for new commands.
 
 ### Color
 
-`ls` colorizes issue IDs, State (green = resolved, yellow = active), and
-Priority (red = critical/major, dim = minor); `show` highlights the issue ID.
+`read issue ls` colorizes issue IDs, State (green = resolved, yellow = active), and
+Priority (red = critical/major, dim = minor); `read issue show` highlights the issue ID.
 clap's help/error messages are colorized too. Output is routed through
 [`anstream`](https://docs.rs/anstream), so color is auto-disabled when
 stdout/stderr is not a TTY (e.g. piped to a file or another program) and honors
 the `NO_COLOR` and `CLICOLOR`/`CLICOLOR_FORCE` environment variables — agent-safe
 by default.
 
-`-f` on `new` uses YouTrack command syntax and is applied right after creation
-(`-f "Priority Critical" -f "Type Bug"`).
+`-f` on `write issue new` uses YouTrack command syntax and is applied right after
+creation (`-f "Priority Critical" -f "Type Bug"`).
 
-`yt project new` requires a token with **admin permissions** (it POSTs to
+`yt write project create` requires a token with **admin permissions** (it POSTs to
 `/api/admin/projects`); a non-admin token returns `HTTP 403` and the server's
 message is surfaced. The current user is set as project leader automatically.
 Creating or attaching project custom fields is likewise admin-only and is not
-implemented — use `yt fields PROJECT` to list a project's fields.
+implemented — use `yt read project fields PROJECT` to list a project's fields.
 
 ### Examples
 
 ```sh
-yt ls "project: DEMO #Unresolved sort by: updated desc" -n 10
-yt show DEMO-42 -c
-yt new DEMO "Login button misaligned" -d - -f "Priority Major"
-yt cmd "State {In Progress} assignee me" DEMO-42 DEMO-43 -m "picking this up"
+yt read issue ls "project: DEMO #Unresolved sort by: updated desc" -n 10
+yt read issue show DEMO-42 -c
+yt write issue new DEMO "Login button misaligned" -d - -f "Priority Major"
+yt write issue cmd "State {In Progress} assignee me" DEMO-42 DEMO-43 -m "picking this up"
 ```
 
 ## Agent setup
@@ -157,18 +168,19 @@ uses `yt` instead of a heavier MCP integration:
 
 ```markdown
 ## YouTrack
-Use the `yt` CLI for issue tracking (auth already configured):
-- `yt ls "project: DEMO #Unresolved sort by: updated desc" [-n N] [--full]` — search
-- `yt show DEMO-1 [-c]` — detail (+comments); `yt comments DEMO-1`
-- `yt new DEMO "summary" -d - [-f "Priority Critical"]` — create, desc from stdin, prints ID
-- `yt edit DEMO-1 -s "new summary" -d -` — edit summary/description (desc from stdin)
-- `yt comment DEMO-1 "text"` — comment
-- `yt links DEMO-1`, `yt link DEMO-1 "relates to" DEMO-2`, `yt unlink DEMO-1 "depends on" DEMO-3` — issue relations
-- `yt attachments DEMO-1 [-o DIR]` — list attachments; `-o` downloads them (default cwd)
-- `yt attach DEMO-1 shot.png log.txt [-c 4-9]` — upload files to the issue (or comment `4-9`)
-- `yt cmd "State Done assignee me" DEMO-1 DEMO-2 [-m "note"]` — batch state/assign/etc.
-- `yt tags` — list tags; `yt tag DEMO-1 Blocked` / `yt untag DEMO-1 Blocked` — add/remove tag
-- `yt projects`, `yt fields DEMO`, `yt query-help` — discovery
+Use the `yt` CLI for issue tracking (auth already configured). Commands live
+under `yt read …` (safe) or `yt write …` (mutating):
+- `yt read issue ls "project: DEMO #Unresolved sort by: updated desc" [-n N] [--full]` — search
+- `yt read issue show DEMO-1 [-c] [--pr]` — detail (+comments/PRs); `yt read issue comments DEMO-1`
+- `yt write issue new DEMO "summary" -d - [-f "Priority Critical"]` — create, desc from stdin, prints ID
+- `yt write issue edit DEMO-1 -s "new summary" -d -` — edit summary/description (desc from stdin)
+- `yt write issue comment DEMO-1 "text"` — comment
+- `yt read issue links DEMO-1`, `yt write issue link DEMO-1 "relates to" DEMO-2`, `yt write issue unlink DEMO-1 "depends on" DEMO-3` — relations
+- `yt read issue attachments DEMO-1 [-o DIR]` — list attachments; `-o` downloads them (default cwd)
+- `yt write issue attach DEMO-1 shot.png log.txt [-c 4-9]` — upload files to the issue (or comment `4-9`)
+- `yt write issue cmd "State Done assignee me" DEMO-1 DEMO-2 [-m "note"]` — batch state/assign/etc.
+- `yt read issue tags` — list tags; `yt write issue tag DEMO-1 Blocked` / `yt write issue untag DEMO-1 Blocked` — add/remove tag
+- `yt read project ls`, `yt read project fields DEMO`, `yt read query-help` — discovery
 ```
 
 ## License

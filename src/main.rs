@@ -30,8 +30,57 @@ struct Cli {
     cmd: Cmd,
 }
 
+// The command tree is split into two permission tiers so an access guard can
+// gate the whole CLI with two stable prefixes (`yt read` / `yt write`) instead
+// of enumerating every subcommand. New subcommands inherit the correct tier for
+// free by landing under the right noun. Layout: tier -> noun -> verb.
 #[derive(Subcommand)]
 enum Cmd {
+    /// Read-only operations (guard prefix: `yt read`)
+    Read {
+        #[command(subcommand)]
+        cmd: ReadCmd,
+    },
+    /// State-mutating operations (guard prefix: `yt write`)
+    Write {
+        #[command(subcommand)]
+        cmd: WriteCmd,
+    },
+    /// Print a shell completion script to stdout
+    Completions {
+        /// Target shell
+        shell: Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReadCmd {
+    /// Read issues (search, show, attachments, comments, links, tags)
+    Issue {
+        #[command(subcommand)]
+        cmd: ReadIssueCmd,
+    },
+    /// Read projects (list, fields)
+    Project {
+        #[command(subcommand)]
+        cmd: ReadProjectCmd,
+    },
+    /// Read users (list, me)
+    User {
+        #[command(subcommand)]
+        cmd: ReadUserCmd,
+    },
+    /// Read local server config
+    Server {
+        #[command(subcommand)]
+        cmd: ReadServerCmd,
+    },
+    /// Print query syntax cheat sheet
+    QueryHelp,
+}
+
+#[derive(Subcommand)]
+enum ReadIssueCmd {
     /// Search issues, one line each: ID  STATE  PRIO  SUMMARY
     Ls {
         /// YouTrack query, e.g. "project: DEMO #Unresolved sort by: updated desc"
@@ -57,6 +106,70 @@ enum Cmd {
         #[arg(long)]
         pr: bool,
     },
+    /// List an issue's attachments; -o DIR downloads them
+    Attachments {
+        id: String,
+        /// Download all attachments to DIR (default: current directory)
+        #[arg(short = 'o', long = "out")]
+        out: Option<Option<String>>,
+    },
+    /// List an issue's comments
+    Comments { id: String },
+    /// List an issue's links to other issues, grouped by relation
+    Links { id: String },
+    /// List tags (one name per line)
+    Tags,
+}
+
+#[derive(Subcommand)]
+enum ReadProjectCmd {
+    /// List projects
+    Ls,
+    /// Show a project's custom fields and allowed values
+    Fields { project: String },
+}
+
+#[derive(Subcommand)]
+enum ReadUserCmd {
+    /// Search users by name/login
+    Ls { query: String },
+    /// Show the authenticated user
+    Me,
+}
+
+#[derive(Subcommand)]
+enum ReadServerCmd {
+    /// List configured servers (* marks the default)
+    Ls,
+}
+
+#[derive(Subcommand)]
+enum WriteCmd {
+    /// Mutate issues (new, edit, attach, comment, link, unlink, cmd, tag, untag)
+    Issue {
+        #[command(subcommand)]
+        cmd: WriteIssueCmd,
+    },
+    /// Mutate projects (create)
+    Project {
+        #[command(subcommand)]
+        cmd: WriteProjectCmd,
+    },
+    /// Mutate local server config (default, auth)
+    Server {
+        #[command(subcommand)]
+        cmd: WriteServerCmd,
+    },
+    /// Update yt to the latest release (downloads from GitHub, verifies sha256)
+    Update {
+        /// Reinstall the latest even if already up to date
+        #[arg(short, long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WriteIssueCmd {
     /// Create an issue; prints the new ID only
     New {
         /// Project short name or name, e.g. DEMO
@@ -65,7 +178,7 @@ enum Cmd {
         /// Description ("-" reads stdin)
         #[arg(short, long)]
         desc: Option<String>,
-        /// Field assignment in command syntax, repeatable, e.g. -f "Priority Critical" -f "State In Progress" (field names vary by project — see `yt fields <PROJECT>`)
+        /// Field assignment in command syntax, repeatable, e.g. -f "Priority Critical" -f "State In Progress" (field names vary by project — see `yt read project fields <PROJECT>`)
         #[arg(short, long)]
         field: Vec<String>,
     },
@@ -79,13 +192,6 @@ enum Cmd {
         #[arg(short, long)]
         desc: Option<String>,
     },
-    /// List an issue's attachments; -o DIR downloads them
-    Attachments {
-        id: String,
-        /// Download all attachments to DIR (default: current directory)
-        #[arg(short = 'o', long = "out")]
-        out: Option<Option<String>>,
-    },
     /// Attach one or more files to an issue (or a comment with -c)
     Attach {
         id: String,
@@ -97,24 +203,20 @@ enum Cmd {
     },
     /// Add a comment (text arg, or stdin if omitted)
     Comment { id: String, text: Option<String> },
-    /// List an issue's comments
-    Comments { id: String },
-    /// List an issue's links to other issues, grouped by relation
-    Links { id: String },
-    /// Link two issues, e.g. yt link YT-1 "relates to" YT-2 (run `yt links <id>` for the phrases this server accepts)
+    /// Link two issues, e.g. yt write issue link YT-1 "relates to" YT-2 (run `yt read issue links <id>` for the phrases this server accepts)
     Link {
         id: String,
         /// Relation phrase, e.g. "relates to", "depends on", "subtask of"
         phrase: String,
         target: String,
     },
-    /// Remove a link between two issues (same phrase as `yt link`)
+    /// Remove a link between two issues (same phrase as `yt write issue link`)
     Unlink {
         id: String,
         phrase: String,
         target: String,
     },
-    /// Apply a YouTrack command to issues, e.g. yt cmd "State Fixed assignee me" DEMO-1 DEMO-2
+    /// Apply a YouTrack command to issues, e.g. yt write issue cmd "State Fixed assignee me" DEMO-1 DEMO-2
     #[allow(clippy::enum_variant_names)]
     Cmd {
         command: String,
@@ -124,27 +226,25 @@ enum Cmd {
         #[arg(short = 'm', long)]
         comment: Option<String>,
     },
-    /// List tags (one name per line)
-    Tags,
     /// Add a tag (by name) to an issue
     Tag { id: String, tag: String },
     /// Remove a tag (by name) from an issue
     Untag { id: String, tag: String },
-    /// List projects
-    Projects,
-    /// Manage projects (admin token required for creation)
-    Project {
-        #[command(subcommand)]
-        cmd: ProjectCmd,
+}
+
+#[derive(Subcommand)]
+enum WriteProjectCmd {
+    /// Create a project (requires an admin token); prints SHORT  ID
+    Create {
+        /// Short name / key, e.g. DEMO
+        short: String,
+        /// Full project name
+        name: String,
     },
-    /// Show a project's custom fields and allowed values
-    Fields { project: String },
-    /// Show the authenticated user
-    Me,
-    /// Search users by name/login
-    Users { query: String },
-    /// Print query syntax cheat sheet
-    QueryHelp,
+}
+
+#[derive(Subcommand)]
+enum WriteServerCmd {
     /// Save credentials to ~/.config/yt/config.json (env vars still take precedence)
     Auth {
         /// YouTrack base URL, e.g. https://youtrack.example.com
@@ -154,33 +254,9 @@ enum Cmd {
         /// Server name; defaults to "default" (warns if overwriting an existing default)
         name: Option<String>,
     },
-    /// List configured servers (* marks the default)
-    Servers,
     /// Set the default server
     Default {
         /// Server name
-        name: String,
-    },
-    /// Print a shell completion script to stdout
-    Completions {
-        /// Target shell
-        shell: Shell,
-    },
-    /// Update yt to the latest release (downloads from GitHub, verifies sha256)
-    Update {
-        /// Reinstall the latest even if already up to date
-        #[arg(short, long)]
-        force: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum ProjectCmd {
-    /// Create a project (requires an admin token); prints SHORT  ID
-    New {
-        /// Short name / key, e.g. DEMO
-        short: String,
-        /// Full project name
         name: String,
     },
 }
@@ -944,74 +1020,106 @@ fn self_update(force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Commands that operate purely on local state (completion scripts, the query
+/// cheat sheet, self-update, and the credential store) and so never build an API
+/// client. Handled before `Client::resolve`. Returns true when it handled `cmd`.
+fn run_local(cmd: &Cmd) -> Result<bool> {
+    match cmd {
+        Cmd::Completions { shell } => {
+            let mut command = Cli::command();
+            let name = command.get_name().to_string();
+            clap_complete::generate(*shell, &mut command, name, &mut anstream::stdout());
+        }
+        Cmd::Read {
+            cmd: ReadCmd::QueryHelp,
+        } => println!("{QUERY_HELP}"),
+        Cmd::Write {
+            cmd: WriteCmd::Update { force },
+        } => self_update(*force)?,
+        Cmd::Read {
+            cmd: ReadCmd::Server {
+                cmd: ReadServerCmd::Ls,
+            },
+        } => {
+            let cfg = Config::load()?;
+            if cfg.servers.is_empty() {
+                println!("no servers configured; run `yt write server auth URL TOKEN [name]`");
+            }
+            for (name, (url, _)) in &cfg.servers {
+                let mark = if cfg.default.as_deref() == Some(name) {
+                    "*"
+                } else {
+                    " "
+                };
+                println!("{mark} {name}  {url}");
+            }
+        }
+        Cmd::Write {
+            cmd:
+                WriteCmd::Server {
+                    cmd: WriteServerCmd::Auth { url, token, name },
+                },
+        } => {
+            let token = if token == "-" {
+                stdin_text()?
+            } else {
+                token.clone()
+            };
+            let mut cfg = Config::load()?;
+            let name = name.clone().unwrap_or_else(|| "default".to_string());
+            if name == "default" && cfg.servers.contains_key("default") {
+                eprintln!(
+                    "warning: overwriting existing 'default' server (pass a name to keep both)"
+                );
+            }
+            cfg.servers.insert(name.clone(), (url.clone(), token));
+            // first server added becomes the default
+            if cfg.default.is_none() {
+                cfg.default = Some(name.clone());
+            }
+            cfg.save()?;
+            println!("saved server '{name}' to {}", config_path().display());
+        }
+        Cmd::Write {
+            cmd:
+                WriteCmd::Server {
+                    cmd: WriteServerCmd::Default { name },
+                },
+        } => {
+            let mut cfg = Config::load()?;
+            if !cfg.servers.contains_key(name) {
+                bail!("no server named '{name}': run `yt read server ls` to list");
+            }
+            cfg.default = Some(name.clone());
+            cfg.save()?;
+            println!("default server is now '{name}'");
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    if let Cmd::Completions { shell } = cli.cmd {
-        let mut cmd = Cli::command();
-        let name = cmd.get_name().to_string();
-        clap_complete::generate(shell, &mut cmd, name, &mut anstream::stdout());
-        return Ok(());
-    }
-    if let Cmd::QueryHelp = cli.cmd {
-        println!("{QUERY_HELP}");
-        return Ok(());
-    }
-    if let Cmd::Update { force } = cli.cmd {
-        return self_update(force);
-    }
-    if let Cmd::Auth { url, token, name } = &cli.cmd {
-        let token = if token == "-" {
-            stdin_text()?
-        } else {
-            token.clone()
-        };
-        let mut cfg = Config::load()?;
-        let name = name.clone().unwrap_or_else(|| "default".to_string());
-        if name == "default" && cfg.servers.contains_key("default") {
-            eprintln!("warning: overwriting existing 'default' server (pass a name to keep both)");
-        }
-        cfg.servers.insert(name.clone(), (url.clone(), token));
-        // first server added becomes the default
-        if cfg.default.is_none() {
-            cfg.default = Some(name.clone());
-        }
-        cfg.save()?;
-        println!("saved server '{name}' to {}", config_path().display());
-        return Ok(());
-    }
-    if let Cmd::Servers = cli.cmd {
-        let cfg = Config::load()?;
-        if cfg.servers.is_empty() {
-            println!("no servers configured; run `yt auth URL TOKEN [name]`");
-        }
-        for (name, (url, _)) in &cfg.servers {
-            let mark = if cfg.default.as_deref() == Some(name) {
-                "*"
-            } else {
-                " "
-            };
-            println!("{mark} {name}  {url}");
-        }
-        return Ok(());
-    }
-    if let Cmd::Default { name } = &cli.cmd {
-        let mut cfg = Config::load()?;
-        if !cfg.servers.contains_key(name) {
-            bail!("no server named '{name}': run `yt servers` to list");
-        }
-        cfg.default = Some(name.clone());
-        cfg.save()?;
-        println!("default server is now '{name}'");
+    if run_local(&cli.cmd)? {
         return Ok(());
     }
     let c = Client::resolve(cli.server.as_deref())?;
 
+    // The remaining commands all hit the API. Local-only variants (completions,
+    // query-help, server config) were handled by `run_local` above.
     match cli.cmd {
-        Cmd::Ls {
-            query,
-            limit,
-            full,
-            merged_pr,
+        Cmd::Read {
+            cmd:
+                ReadCmd::Issue {
+                    cmd:
+                        ReadIssueCmd::Ls {
+                            query,
+                            limit,
+                            full,
+                            merged_pr,
+                        },
+                },
         } => {
             let fields = if full {
                 format!("{LIST_FIELDS},description")
@@ -1069,7 +1177,12 @@ fn run() -> Result<()> {
                 println!("# limit {limit} reached; refine query or raise -n");
             }
         }
-        Cmd::Show { id, comments, pr } => {
+        Cmd::Read {
+            cmd:
+                ReadCmd::Issue {
+                    cmd: ReadIssueCmd::Show { id, comments, pr },
+                },
+        } => {
             let i = c.get(&format!("issues/{id}"), &[("fields", ISSUE_FIELDS)])?;
             let ids = id_style();
             anstream::println!(
@@ -1126,11 +1239,17 @@ fn run() -> Result<()> {
                 print_comments(&c, i["idReadable"].as_str().unwrap_or(&id))?;
             }
         }
-        Cmd::New {
-            project,
-            summary,
-            desc,
-            field,
+        Cmd::Write {
+            cmd:
+                WriteCmd::Issue {
+                    cmd:
+                        WriteIssueCmd::New {
+                            project,
+                            summary,
+                            desc,
+                            field,
+                        },
+                },
         } => {
             let (pid, _short) = resolve_project(&c, &project)?;
             let desc = match desc.as_deref() {
@@ -1156,7 +1275,12 @@ fn run() -> Result<()> {
             }
             println!("{id}");
         }
-        Cmd::Edit { id, summary, desc } => {
+        Cmd::Write {
+            cmd:
+                WriteCmd::Issue {
+                    cmd: WriteIssueCmd::Edit { id, summary, desc },
+                },
+        } => {
             let desc = match desc.as_deref() {
                 Some("-") => Some(stdin_text()?),
                 d => d.map(String::from),
@@ -1174,7 +1298,12 @@ fn run() -> Result<()> {
             c.post(&format!("issues/{id}"), &[("fields", "idReadable")], body)?;
             println!("{id}");
         }
-        Cmd::Comment { id, text } => {
+        Cmd::Write {
+            cmd:
+                WriteCmd::Issue {
+                    cmd: WriteIssueCmd::Comment { id, text },
+                },
+        } => {
             let text = match text {
                 Some(t) => t,
                 None => stdin_text()?,
@@ -1185,9 +1314,22 @@ fn run() -> Result<()> {
             c.post(&format!("issues/{id}/comments"), &[], json!({"text": text}))?;
             println!("ok");
         }
-        Cmd::Comments { id } => print_comments(&c, &id)?,
-        Cmd::Links { id } => print_links(&c, &id)?,
-        Cmd::Link { id, phrase, target } => {
+        Cmd::Read {
+            cmd: ReadCmd::Issue {
+                cmd: ReadIssueCmd::Comments { id },
+            },
+        } => print_comments(&c, &id)?,
+        Cmd::Read {
+            cmd: ReadCmd::Issue {
+                cmd: ReadIssueCmd::Links { id },
+            },
+        } => print_links(&c, &id)?,
+        Cmd::Write {
+            cmd:
+                WriteCmd::Issue {
+                    cmd: WriteIssueCmd::Link { id, phrase, target },
+                },
+        } => {
             let group = resolve_link_group(&c, &id, &phrase)?;
             c.post(
                 &format!("issues/{id}/links/{group}/issues"),
@@ -1196,13 +1338,23 @@ fn run() -> Result<()> {
             )?;
             println!("{id} {phrase} {target}");
         }
-        Cmd::Unlink { id, phrase, target } => {
+        Cmd::Write {
+            cmd:
+                WriteCmd::Issue {
+                    cmd: WriteIssueCmd::Unlink { id, phrase, target },
+                },
+        } => {
             let group = resolve_link_group(&c, &id, &phrase)?;
             let tid = internal_id(&c, &target)?;
             c.delete(&format!("issues/{id}/links/{group}/issues/{tid}"))?;
             println!("{id} unlinked {target}");
         }
-        Cmd::Attachments { id, out } => {
+        Cmd::Read {
+            cmd:
+                ReadCmd::Issue {
+                    cmd: ReadIssueCmd::Attachments { id, out },
+                },
+        } => {
             let atts = c.get(
                 &format!("issues/{id}/attachments"),
                 &[("fields", "id,name,size,url")],
@@ -1238,7 +1390,12 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Cmd::Attach { id, files, comment } => {
+        Cmd::Write {
+            cmd:
+                WriteCmd::Issue {
+                    cmd: WriteIssueCmd::Attach { id, files, comment },
+                },
+        } => {
             let path = match &comment {
                 Some(cid) => format!("issues/{id}/comments/{cid}/attachments"),
                 None => format!("issues/{id}/attachments"),
@@ -1252,10 +1409,16 @@ fn run() -> Result<()> {
                 );
             }
         }
-        Cmd::Cmd {
-            command,
-            ids,
-            comment,
+        Cmd::Write {
+            cmd:
+                WriteCmd::Issue {
+                    cmd:
+                        WriteIssueCmd::Cmd {
+                            command,
+                            ids,
+                            comment,
+                        },
+                },
         } => {
             let mut body = json!({"query": command, "issues": ids.iter().map(|i| issue_ref(i)).collect::<Vec<_>>()});
             if let Some(m) = comment {
@@ -1264,7 +1427,11 @@ fn run() -> Result<()> {
             c.post("commands", &[], body)?;
             println!("ok");
         }
-        Cmd::Tags => {
+        Cmd::Read {
+            cmd: ReadCmd::Issue {
+                cmd: ReadIssueCmd::Tags,
+            },
+        } => {
             let tags = c.get("tags", &[("fields", "id,name"), ("$top", "500")])?;
             let list = tags.as_array().cloned().unwrap_or_default();
             if list.is_empty() {
@@ -1274,17 +1441,31 @@ fn run() -> Result<()> {
                 println!("{}", t["name"].as_str().unwrap_or("?"));
             }
         }
-        Cmd::Tag { id, tag } => {
+        Cmd::Write {
+            cmd:
+                WriteCmd::Issue {
+                    cmd: WriteIssueCmd::Tag { id, tag },
+                },
+        } => {
             let tid = resolve_tag(&c, &tag)?;
             c.post(&format!("issues/{id}/tags"), &[], json!({"id": tid}))?;
             println!("ok");
         }
-        Cmd::Untag { id, tag } => {
+        Cmd::Write {
+            cmd:
+                WriteCmd::Issue {
+                    cmd: WriteIssueCmd::Untag { id, tag },
+                },
+        } => {
             let tid = resolve_tag(&c, &tag)?;
             c.delete(&format!("issues/{id}/tags/{tid}"))?;
             println!("ok");
         }
-        Cmd::Projects => {
+        Cmd::Read {
+            cmd: ReadCmd::Project {
+                cmd: ReadProjectCmd::Ls,
+            },
+        } => {
             let projects = c.get(
                 "admin/projects",
                 &[("fields", "shortName,name,archived"), ("$top", "500")],
@@ -1299,26 +1480,34 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Cmd::Project { cmd } => match cmd {
-            ProjectCmd::New { short, name } => {
-                // leader is required; resolve the current user's id to populate it
-                let me = c.get("users/me", &[("fields", "id")])?;
-                let leader = me["id"]
-                    .as_str()
-                    .context("could not resolve current user")?;
-                let created = c.post(
-                    "admin/projects",
-                    &[("fields", "id,shortName")],
-                    json!({"name": name, "shortName": short, "leader": {"id": leader}}),
-                )?;
-                println!(
-                    "{}  {}",
-                    created["shortName"].as_str().unwrap_or(&short),
-                    created["id"].as_str().unwrap_or("?")
-                );
-            }
-        },
-        Cmd::Fields { project } => {
+        Cmd::Write {
+            cmd:
+                WriteCmd::Project {
+                    cmd: WriteProjectCmd::Create { short, name },
+                },
+        } => {
+            // leader is required; resolve the current user's id to populate it
+            let me = c.get("users/me", &[("fields", "id")])?;
+            let leader = me["id"]
+                .as_str()
+                .context("could not resolve current user")?;
+            let created = c.post(
+                "admin/projects",
+                &[("fields", "id,shortName")],
+                json!({"name": name, "shortName": short, "leader": {"id": leader}}),
+            )?;
+            println!(
+                "{}  {}",
+                created["shortName"].as_str().unwrap_or(&short),
+                created["id"].as_str().unwrap_or("?")
+            );
+        }
+        Cmd::Read {
+            cmd:
+                ReadCmd::Project {
+                    cmd: ReadProjectCmd::Fields { project },
+                },
+        } => {
             let (pid, short) = resolve_project(&c, &project)?;
             let fields = c.get(
                 &format!("admin/projects/{pid}/customFields"),
@@ -1387,7 +1576,11 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Cmd::Me => {
+        Cmd::Read {
+            cmd: ReadCmd::User {
+                cmd: ReadUserCmd::Me,
+            },
+        } => {
             let u = c.get("users/me", &[("fields", "login,name,email")])?;
             println!(
                 "{}  {}  {}",
@@ -1396,7 +1589,11 @@ fn run() -> Result<()> {
                 u["email"].as_str().unwrap_or("")
             );
         }
-        Cmd::Users { query } => {
+        Cmd::Read {
+            cmd: ReadCmd::User {
+                cmd: ReadUserCmd::Ls { query },
+            },
+        } => {
             let users = c.get(
                 "users",
                 &[("query", &query), ("fields", "login,name"), ("$top", "10")],
@@ -1413,12 +1610,20 @@ fn run() -> Result<()> {
                 );
             }
         }
-        Cmd::QueryHelp
-        | Cmd::Auth { .. }
-        | Cmd::Servers
-        | Cmd::Default { .. }
-        | Cmd::Completions { .. }
-        | Cmd::Update { .. } => unreachable!(),
+        // Local-only commands handled in `run_local` before the client resolves.
+        Cmd::Completions { .. }
+        | Cmd::Read {
+            cmd: ReadCmd::QueryHelp,
+        }
+        | Cmd::Read {
+            cmd: ReadCmd::Server { .. },
+        }
+        | Cmd::Write {
+            cmd: WriteCmd::Update { .. },
+        }
+        | Cmd::Write {
+            cmd: WriteCmd::Server { .. },
+        } => unreachable!(),
     }
     maybe_print_update_notice();
     Ok(())
