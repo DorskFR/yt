@@ -55,17 +55,17 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ReadCmd {
-    /// Read issues (search, show, attachments, comments, links, tags)
+    /// Read issues (ls, show, attachments, comments, links, tags)
     Issue {
         #[command(subcommand)]
         cmd: ReadIssueCmd,
     },
-    /// Read projects (list, fields)
+    /// Read projects (ls, fields)
     Project {
         #[command(subcommand)]
         cmd: ReadProjectCmd,
     },
-    /// Read users (list, me)
+    /// Read users (ls, me)
     User {
         #[command(subcommand)]
         cmd: ReadUserCmd,
