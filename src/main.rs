@@ -651,6 +651,152 @@ fn resolve_project(c: &Client, key: &str) -> Result<(String, String)> {
         .with_context(|| format!("project not found: {key}"))
 }
 
+/// Build one `customFields` entry for the create body from a field name, the
+/// concrete `IssueCustomField` `$type` (e.g. `SingleEnumIssueCustomField`,
+/// `StateIssueCustomField`, `PeriodIssueCustomField`), and the raw value text.
+/// Returns `None` for types we can't represent from a plain string (dates, or
+/// anything unrecognized) so the caller can fall back to the command endpoint.
+fn issue_cf_entry(name: &str, cf_type: &str, raw: &str) -> Option<Value> {
+    let val = raw.trim();
+    if val.is_empty() {
+        return None;
+    }
+    let multi = cf_type.starts_with("Multi");
+    // Bundle/user/owned/version/build/group fields carry an object value; multi
+    // variants wrap it in an array. `wrap` applies that shape once we pick the key.
+    let wrap = |one: Value| if multi { json!([one]) } else { one };
+    let value = match cf_type {
+        "SingleEnumIssueCustomField"
+        | "MultiEnumIssueCustomField"
+        | "SingleOwnedIssueCustomField"
+        | "MultiOwnedIssueCustomField"
+        | "SingleVersionIssueCustomField"
+        | "MultiVersionIssueCustomField"
+        | "SingleBuildIssueCustomField"
+        | "MultiBuildIssueCustomField"
+        | "SingleGroupIssueCustomField"
+        | "MultiGroupIssueCustomField" => wrap(json!({"name": val})),
+        "StateIssueCustomField" | "StateMachineIssueCustomField" => json!({"name": val}),
+        "SingleUserIssueCustomField" | "MultiUserIssueCustomField" => wrap(json!({"login": val})),
+        "TextIssueCustomField" => json!({"text": val}),
+        "PeriodIssueCustomField" => json!({"presentation": val}),
+        // integer / float / string all use SimpleIssueCustomField; infer the JSON
+        // scalar so numeric fields don't get a string value the server rejects.
+        "SimpleIssueCustomField" => {
+            if let Ok(i) = val.parse::<i64>() {
+                json!(i)
+            } else if let Ok(f) = val.parse::<f64>() {
+                json!(f)
+            } else {
+                json!(val)
+            }
+        }
+        // DateIssueCustomField (epoch-millis) and any unknown type: fall back.
+        _ => return None,
+    };
+    Some(json!({"name": name, "$type": cf_type, "value": value}))
+}
+
+/// Map an admin `fieldType.id` (`enum[1]`, `user[*]`, `period[1]`, `integer`, …)
+/// to the concrete `IssueCustomField` `$type` used in the create body.
+fn fieldtype_id_to_cf_type(type_id: &str) -> Option<&'static str> {
+    let (base, multi) = match type_id.strip_suffix("[*]") {
+        Some(b) => (b, true),
+        None => (type_id.strip_suffix("[1]").unwrap_or(type_id), false),
+    };
+    Some(match (base, multi) {
+        ("enum", false) => "SingleEnumIssueCustomField",
+        ("enum", true) => "MultiEnumIssueCustomField",
+        ("state", _) => "StateIssueCustomField",
+        ("user", false) => "SingleUserIssueCustomField",
+        ("user", true) => "MultiUserIssueCustomField",
+        ("ownedField", false) => "SingleOwnedIssueCustomField",
+        ("ownedField", true) => "MultiOwnedIssueCustomField",
+        ("version", false) => "SingleVersionIssueCustomField",
+        ("version", true) => "MultiVersionIssueCustomField",
+        ("build", false) => "SingleBuildIssueCustomField",
+        ("build", true) => "MultiBuildIssueCustomField",
+        ("group", false) => "SingleGroupIssueCustomField",
+        ("group", true) => "MultiGroupIssueCustomField",
+        ("text", _) => "TextIssueCustomField",
+        ("period", _) => "PeriodIssueCustomField",
+        ("integer" | "float" | "string", _) => "SimpleIssueCustomField",
+        _ => return None,
+    })
+}
+
+/// Discover a project's custom fields as `(name, IssueCustomField $type)` pairs.
+/// Prefers the admin field config (precise, needs project-admin rights); falls
+/// back to sampling `$type` off recent issues, which only needs issue-read access
+/// and so works with a plain reporter token.
+fn project_field_types(c: &Client, pid: &str, short: &str) -> Vec<(String, String)> {
+    if let Ok(cfg) = c.get(
+        &format!("admin/projects/{pid}/customFields"),
+        &[("fields", "field(name,fieldType(id))"), ("$top", "200")],
+    ) {
+        let defs: Vec<(String, String)> = cfg
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|f| {
+                let n = f["field"]["name"].as_str()?.to_string();
+                let t = f["field"]["fieldType"]["id"].as_str()?;
+                Some((n, fieldtype_id_to_cf_type(t)?.to_string()))
+            })
+            .collect();
+        if !defs.is_empty() {
+            return defs;
+        }
+    }
+    // Fallback: observe the concrete $type on fields of recent issues.
+    let mut seen: std::collections::BTreeMap<String, String> = Default::default();
+    if let Ok(issues) = c.get(
+        "issues",
+        &[
+            ("query", &format!("project: {short}")),
+            ("fields", "customFields($type,name)"),
+            ("$top", "100"),
+        ],
+    ) {
+        for i in issues.as_array().into_iter().flatten() {
+            for f in i["customFields"].as_array().into_iter().flatten() {
+                if let (Some(n), Some(t)) = (f["name"].as_str(), f["$type"].as_str()) {
+                    seen.entry(n.to_string()).or_insert_with(|| t.to_string());
+                }
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Turn `-f` command-syntax specs (e.g. `"State In Progress"`, `"Priority Critical"`)
+/// into a native `customFields` array for the create body, resolving each field's
+/// type from the project. Returns `None` if the types can't be discovered, a field
+/// name doesn't match, or any value can't be represented — signalling the caller to
+/// fall back to the two-step `commands` path (never a regression).
+fn resolve_custom_fields(c: &Client, pid: &str, short: &str, fields: &[String]) -> Option<Value> {
+    let defs = project_field_types(c, pid, short);
+    if defs.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(fields.len());
+    for spec in fields {
+        let spec_l = spec.to_ascii_lowercase();
+        // Longest field name that is a whole-word prefix of the spec wins, so
+        // "Sprint Board" is preferred over "Sprint" when both exist.
+        let (name, cf_type) = defs
+            .iter()
+            .filter(|(n, _)| {
+                let nl = n.to_ascii_lowercase();
+                spec_l == nl || spec_l.starts_with(&format!("{nl} "))
+            })
+            .max_by_key(|(n, _)| n.len())?;
+        let value = spec.get(name.len()..).unwrap_or_default();
+        out.push(issue_cf_entry(name, cf_type, value)?);
+    }
+    Some(json!(out))
+}
+
 /// Resolve a tag name to its internal id via GET /api/tags.
 fn resolve_tag(c: &Client, name: &str) -> Result<String> {
     let tags = c.get("tags", &[("fields", "id,name"), ("$top", "500")])?;
@@ -1251,7 +1397,7 @@ fn run() -> Result<()> {
                         },
                 },
         } => {
-            let (pid, _short) = resolve_project(&c, &project)?;
+            let (pid, short) = resolve_project(&c, &project)?;
             let desc = match desc.as_deref() {
                 Some("-") => Some(stdin_text()?),
                 d => d.map(String::from),
@@ -1260,12 +1406,25 @@ fn run() -> Result<()> {
             if let Some(d) = desc {
                 body["description"] = json!(d);
             }
+            // Prefer setting custom fields atomically in the create call, so no
+            // separate mutation fires project workflows (e.g. auto-assign on state
+            // change) and there's no created-but-unconfigured partial-failure window.
+            // If any field can't be resolved to a native type, fall back below.
+            let embedded = if field.is_empty() {
+                false
+            } else if let Some(cf) = resolve_custom_fields(&c, &pid, &short, &field) {
+                body["customFields"] = cf;
+                true
+            } else {
+                false
+            };
             let created = c.post("issues", &[("fields", "idReadable")], body)?;
             let id = created["idReadable"]
                 .as_str()
                 .context("create returned no id")?
                 .to_string();
-            if !field.is_empty() {
+            if !field.is_empty() && !embedded {
+                // Fallback: forgiving command-syntax endpoint (a second request).
                 c.post(
                     "commands",
                     &[],
@@ -1907,6 +2066,94 @@ mod tests {
         assert_eq!(cf_get(&issue, "state").as_deref(), Some("Open"));
         assert_eq!(cf_get(&issue, "PRIORITY").as_deref(), Some("Critical"));
         assert_eq!(cf_get(&issue, "Assignee"), None);
+    }
+
+    #[test]
+    fn issue_cf_entry_single_enum() {
+        assert_eq!(
+            issue_cf_entry("Priority", "SingleEnumIssueCustomField", "Critical"),
+            Some(json!({
+                "name": "Priority",
+                "$type": "SingleEnumIssueCustomField",
+                "value": {"name": "Critical"}
+            }))
+        );
+    }
+
+    #[test]
+    fn issue_cf_entry_state_and_multi_and_user() {
+        // state is always single, object value
+        assert_eq!(
+            issue_cf_entry("State", "StateIssueCustomField", "In Progress"),
+            Some(json!({
+                "name": "State",
+                "$type": "StateIssueCustomField",
+                "value": {"name": "In Progress"}
+            }))
+        );
+        // multi wraps the value in an array and uses the Multi* type
+        assert_eq!(
+            issue_cf_entry("Tags", "MultiEnumIssueCustomField", "backend"),
+            Some(json!({
+                "name": "Tags",
+                "$type": "MultiEnumIssueCustomField",
+                "value": [{"name": "backend"}]
+            }))
+        );
+        // user fields key on login
+        assert_eq!(
+            issue_cf_entry("Assignee", "SingleUserIssueCustomField", "shoko"),
+            Some(json!({
+                "name": "Assignee",
+                "$type": "SingleUserIssueCustomField",
+                "value": {"login": "shoko"}
+            }))
+        );
+    }
+
+    #[test]
+    fn issue_cf_entry_scalars_and_unsupported() {
+        // integer parses to a JSON number
+        assert_eq!(
+            issue_cf_entry("Estimation", "SimpleIssueCustomField", "5"),
+            Some(json!({"name": "Estimation", "$type": "SimpleIssueCustomField", "value": 5}))
+        );
+        // non-numeric into a simple field is kept as a string (server validates)
+        assert_eq!(
+            issue_cf_entry("Note", "SimpleIssueCustomField", "soon"),
+            Some(json!({"name": "Note", "$type": "SimpleIssueCustomField", "value": "soon"}))
+        );
+        // dates fall back to the command endpoint
+        assert_eq!(
+            issue_cf_entry("Due Date", "DateIssueCustomField", "2026-07-03"),
+            None
+        );
+        // empty value -> None
+        assert_eq!(
+            issue_cf_entry("Priority", "SingleEnumIssueCustomField", "  "),
+            None
+        );
+    }
+
+    #[test]
+    fn fieldtype_id_maps_to_issue_cf_type() {
+        assert_eq!(
+            fieldtype_id_to_cf_type("enum[1]"),
+            Some("SingleEnumIssueCustomField")
+        );
+        assert_eq!(
+            fieldtype_id_to_cf_type("user[*]"),
+            Some("MultiUserIssueCustomField")
+        );
+        assert_eq!(
+            fieldtype_id_to_cf_type("state[1]"),
+            Some("StateIssueCustomField")
+        );
+        assert_eq!(
+            fieldtype_id_to_cf_type("integer"),
+            Some("SimpleIssueCustomField")
+        );
+        assert_eq!(fieldtype_id_to_cf_type("date"), None);
     }
 
     #[test]
