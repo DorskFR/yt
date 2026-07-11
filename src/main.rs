@@ -26,6 +26,12 @@ struct Cli {
     /// Use a named server from config (env vars still take precedence)
     #[arg(long, global = true)]
     server: Option<String>,
+    /// Suppress watcher notifications on `yt write issue …` calls by sending
+    /// muteUpdateNotifications=true (also via YT_MUTE_NOTIFICATIONS=1; the flag
+    /// wins). The server ignores it unless the token's user has the *Apply
+    /// Commands Silently* permission.
+    #[arg(long, global = true)]
+    silent: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -355,10 +361,18 @@ fn normalize_base(url: &str) -> String {
 struct Client {
     base: String,
     token: String,
+    silent: bool,
+}
+
+/// Whether mutating writes should suppress notifications. The `--silent` flag
+/// wins; otherwise YT_MUTE_NOTIFICATIONS enables it when set to "1" or "true".
+/// Pure.
+fn mute_notifications(flag: bool, env: Option<&str>) -> bool {
+    flag || matches!(env, Some("1") | Some("true"))
 }
 
 impl Client {
-    fn resolve(server: Option<&str>) -> Result<Self> {
+    fn resolve(server: Option<&str>, silent: bool) -> Result<Self> {
         let env_url = std::env::var("YOUTRACK_URL").ok();
         let env_token = std::env::var("YOUTRACK_API_TOKEN").ok();
         let (url, token) = match (env_url, env_token) {
@@ -376,6 +390,7 @@ impl Client {
         Ok(Self {
             base: normalize_base(&url),
             token,
+            silent,
         })
     }
 
@@ -385,6 +400,9 @@ impl Client {
             .set("Accept", "application/json");
         for (k, v) in params {
             r = r.query(k, v);
+        }
+        if self.silent && matches!(method, "POST" | "PUT" | "DELETE") {
+            r = r.query("muteUpdateNotifications", "true");
         }
         r
     }
@@ -1250,7 +1268,11 @@ fn run() -> Result<()> {
     if run_local(&cli.cmd)? {
         return Ok(());
     }
-    let c = Client::resolve(cli.server.as_deref())?;
+    let silent = mute_notifications(
+        cli.silent,
+        std::env::var("YT_MUTE_NOTIFICATIONS").ok().as_deref(),
+    );
+    let c = Client::resolve(cli.server.as_deref(), silent)?;
 
     // The remaining commands all hit the API. Local-only variants (completions,
     // query-help, server config) were handled by `run_local` above.
@@ -1980,11 +2002,76 @@ mod tests {
     fn resolve_prefers_env_over_config() {
         std::env::set_var("YOUTRACK_URL", "https://env.example.com/");
         std::env::set_var("YOUTRACK_API_TOKEN", "envtok");
-        let c = Client::resolve(None).unwrap();
+        let c = Client::resolve(None, false).unwrap();
         std::env::remove_var("YOUTRACK_URL");
         std::env::remove_var("YOUTRACK_API_TOKEN");
         assert_eq!(c.base, "https://env.example.com/api");
         assert_eq!(c.token, "envtok");
+    }
+
+    // ---- silent writes (muteUpdateNotifications) ----
+
+    #[test]
+    fn mute_notifications_flag_and_env() {
+        // flag alone
+        assert!(mute_notifications(true, None));
+        // env values that enable
+        assert!(mute_notifications(false, Some("1")));
+        assert!(mute_notifications(false, Some("true")));
+        // env off / absent / unrecognized
+        assert!(!mute_notifications(false, None));
+        assert!(!mute_notifications(false, Some("0")));
+        assert!(!mute_notifications(false, Some("false")));
+        assert!(!mute_notifications(false, Some("yes")));
+        // flag wins over a disabling/absent env
+        assert!(mute_notifications(true, Some("0")));
+        assert!(mute_notifications(true, Some("false")));
+    }
+
+    fn test_client(silent: bool) -> Client {
+        Client {
+            base: "https://yt.example.com/api".into(),
+            token: "t".into(),
+            silent,
+        }
+    }
+
+    fn has_mute(req: &ureq::Request) -> bool {
+        req.request_url()
+            .unwrap()
+            .query_pairs()
+            .iter()
+            .any(|(k, v)| *k == "muteUpdateNotifications" && *v == "true")
+    }
+
+    #[test]
+    fn silent_adds_param_to_mutating_requests() {
+        let c = test_client(true);
+        assert!(has_mute(&c.req("POST", "issues/DEMO-1/comments", &[])));
+        assert!(has_mute(&c.req("PUT", "issues/DEMO-1", &[])));
+        assert!(has_mute(&c.req("DELETE", "issues/DEMO-1/tags/1", &[])));
+        // existing params are preserved alongside the mute param
+        let req = c.req("POST", "issues", &[("fields", "idReadable")]);
+        assert!(has_mute(&req));
+        let url = req.request_url().unwrap();
+        assert!(url
+            .query_pairs()
+            .iter()
+            .any(|(k, v)| *k == "fields" && *v == "idReadable"));
+    }
+
+    #[test]
+    fn silent_off_omits_param() {
+        let c = test_client(false);
+        assert!(!has_mute(&c.req("POST", "issues/DEMO-1/comments", &[])));
+        assert!(!has_mute(&c.req("DELETE", "issues/DEMO-1/tags/1", &[])));
+    }
+
+    #[test]
+    fn silent_never_touches_read_requests() {
+        // GET is a read even under silent mode
+        assert!(!has_mute(&test_client(true).req("GET", "issues", &[])));
+        assert!(!has_mute(&test_client(false).req("GET", "issues", &[])));
     }
 
     // ---- compact output formatting helpers ----
