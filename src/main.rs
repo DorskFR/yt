@@ -1545,7 +1545,11 @@ fn run() -> Result<()> {
                     cmd: ReadIssueCmd::Show { id, comments, pr },
                 },
         } => {
-            let fields = if json { ISSUE_FIELDS_JSON } else { ISSUE_FIELDS };
+            let fields = if json {
+                ISSUE_FIELDS_JSON
+            } else {
+                ISSUE_FIELDS
+            };
             let i = c.get(&format!("issues/{id}"), &[("fields", fields)])?;
             if json {
                 print_json(&i)?;
@@ -1758,7 +1762,10 @@ fn run() -> Result<()> {
             },
         } => {
             if json {
-                let links = c.get(&format!("issues/{id}/links"), &[("fields", LINK_FIELDS_JSON)])?;
+                let links = c.get(
+                    &format!("issues/{id}/links"),
+                    &[("fields", LINK_FIELDS_JSON)],
+                )?;
                 print_json(&links)?;
             } else {
                 print_links(&c, &id)?;
@@ -2068,7 +2075,11 @@ fn run() -> Result<()> {
                 cmd: ReadUserCmd::Ls { query },
             },
         } => {
-            let fields = if json { "id,login,name,email" } else { "login,name" };
+            let fields = if json {
+                "id,login,name,email"
+            } else {
+                "login,name"
+            };
             let users = c.get(
                 "users",
                 &[("query", &query), ("fields", fields), ("$top", "10")],
@@ -2270,14 +2281,24 @@ mod tests {
             "yt", "read", "--json", "issue", "comments", "DEMO-1"
         ]));
         assert!(read_json_flag(&["yt", "read", "project", "ls", "--json"]));
-        assert!(read_json_flag(&["yt", "read", "user", "ls", "alice", "--json"]));
-        assert!(!read_json_flag(&["yt", "read", "issue", "ls", "project: DEMO"]));
+        assert!(read_json_flag(&[
+            "yt", "read", "user", "ls", "alice", "--json"
+        ]));
+        assert!(!read_json_flag(&[
+            "yt",
+            "read",
+            "issue",
+            "ls",
+            "project: DEMO"
+        ]));
         assert!(read_json_flag(&["yt", "read", "api", "tags", "--json"]));
     }
 
     #[test]
     fn json_flag_rejected_on_write_subtree() {
-        assert!(Cli::try_parse_from(["yt", "write", "issue", "tag", "X-1", "t", "--json"]).is_err());
+        assert!(
+            Cli::try_parse_from(["yt", "write", "issue", "tag", "X-1", "t", "--json"]).is_err()
+        );
     }
 
     #[test]
