@@ -7,7 +7,8 @@ use std::io::Read;
 
 const LIST_FIELDS: &str = "idReadable,summary,customFields(name,value(name,login,text))";
 const ISSUE_FIELDS: &str = "idReadable,summary,description,created,updated,reporter(login),customFields(name,value(name,login,text))";
-const COMMENT_FIELDS: &str = "created,text,author(login)";
+const COMMENT_FIELDS: &str =
+    "id,author(login),created,text,visibility($type,permittedGroups(name),permittedUsers(login))";
 const LINK_FIELDS: &str =
     "id,direction,linkType(name,sourceToTarget,targetToSource),issues(idReadable,summary)";
 // Pull requests surface in the activity stream under PullRequestChangeCategory
@@ -83,6 +84,23 @@ enum ReadCmd {
     },
     /// Print query syntax cheat sheet
     QueryHelp,
+    /// Authenticated raw GET against any API path; prints JSON
+    Api {
+        /// Path relative to <base>/api/, e.g. issues/DEMO-1/comments, tags
+        path: String,
+        /// fields= parameter, e.g. id,name
+        #[arg(long)]
+        fields: Option<String>,
+        /// Extra query param as key=value (repeatable)
+        #[arg(long, value_name = "K=V")]
+        query: Vec<String>,
+        /// $top pagination
+        #[arg(long, value_name = "N")]
+        top: Option<usize>,
+        /// $skip pagination
+        #[arg(long, value_name = "N")]
+        skip: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -208,7 +226,34 @@ enum WriteIssueCmd {
         comment: Option<String>,
     },
     /// Add a comment (text arg, or stdin if omitted)
-    Comment { id: String, text: Option<String> },
+    Comment {
+        id: String,
+        text: Option<String>,
+        /// Make the comment visible to everyone
+        #[arg(long, conflicts_with_all = ["group", "user"])]
+        public: bool,
+        /// Restrict visibility to a group by name (repeatable, combinable with --user)
+        #[arg(long)]
+        group: Vec<String>,
+        /// Restrict visibility to a user by login (repeatable, combinable with --group)
+        #[arg(long)]
+        user: Vec<String>,
+    },
+    /// Change an existing comment's visibility; prints the resulting visibility
+    #[command(group(clap::ArgGroup::new("vis").required(true).multiple(true)))]
+    CommentVisibility {
+        issue: String,
+        comment_id: String,
+        /// Make the comment visible to everyone
+        #[arg(long, group = "vis", conflicts_with_all = ["group", "user"])]
+        public: bool,
+        /// Restrict visibility to a group by name (repeatable, combinable with --user)
+        #[arg(long, group = "vis")]
+        group: Vec<String>,
+        /// Restrict visibility to a user by login (repeatable, combinable with --group)
+        #[arg(long, group = "vis")]
+        user: Vec<String>,
+    },
     /// Link two issues, e.g. yt write issue link YT-1 "relates to" YT-2 (run `yt read issue links <id>` for the phrases this server accepts)
     Link {
         id: String,
@@ -815,6 +860,100 @@ fn resolve_custom_fields(c: &Client, pid: &str, short: &str, fields: &[String]) 
     Some(json!(out))
 }
 
+fn api_params(
+    fields: Option<&str>,
+    query: &[String],
+    top: Option<usize>,
+    skip: Option<usize>,
+) -> Result<Vec<(String, String)>> {
+    let mut params = Vec::new();
+    if let Some(f) = fields {
+        params.push(("fields".to_string(), f.to_string()));
+    }
+    for q in query {
+        let (k, v) = q
+            .split_once('=')
+            .with_context(|| format!("bad --query {q:?}: expected key=value"))?;
+        params.push((k.to_string(), v.to_string()));
+    }
+    if let Some(t) = top {
+        params.push(("$top".to_string(), t.to_string()));
+    }
+    if let Some(s) = skip {
+        params.push(("$skip".to_string(), s.to_string()));
+    }
+    Ok(params)
+}
+
+/// Build a comment `visibility` value from resolved ids. Pure.
+fn visibility_payload(public: bool, group_ids: &[String], user_ids: &[String]) -> Value {
+    if public {
+        return json!({"$type": "UnlimitedVisibility"});
+    }
+    let refs = |ids: &[String]| ids.iter().map(|i| json!({"id": i})).collect::<Vec<_>>();
+    let mut v = json!({"$type": "LimitedVisibility"});
+    if !group_ids.is_empty() {
+        v["permittedGroups"] = json!(refs(group_ids));
+    }
+    if !user_ids.is_empty() {
+        v["permittedUsers"] = json!(refs(user_ids));
+    }
+    v
+}
+
+fn resolve_group(c: &Client, name: &str) -> Result<String> {
+    let groups = c.get("groups", &[("fields", "id,name"), ("$top", "500")])?;
+    groups
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|g| {
+            g["name"]
+                .as_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+        .and_then(|g| g["id"].as_str().map(String::from))
+        .with_context(|| format!("group not found: {name}"))
+}
+
+fn resolve_user(c: &Client, login: &str) -> Result<String> {
+    let users = c.get(
+        "users",
+        &[("query", login), ("fields", "id,login"), ("$top", "50")],
+    )?;
+    users
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|u| {
+            u["login"]
+                .as_str()
+                .is_some_and(|l| l.eq_ignore_ascii_case(login))
+        })
+        .and_then(|u| u["id"].as_str().map(String::from))
+        .with_context(|| format!("user not found: {login}"))
+}
+
+fn resolve_visibility(
+    c: &Client,
+    public: bool,
+    groups: &[String],
+    users: &[String],
+) -> Result<Value> {
+    if public {
+        return Ok(visibility_payload(true, &[], &[]));
+    }
+    let gids = groups
+        .iter()
+        .map(|g| resolve_group(c, g))
+        .collect::<Result<Vec<_>>>()?;
+    let uids = users
+        .iter()
+        .map(|u| resolve_user(c, u))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(visibility_payload(false, &gids, &uids))
+}
+
 /// Resolve a tag name to its internal id via GET /api/tags.
 fn resolve_tag(c: &Client, name: &str) -> Result<String> {
     let tags = c.get("tags", &[("fields", "id,name"), ("$top", "500")])?;
@@ -879,6 +1018,33 @@ fn issue_ref(id: &str) -> Value {
     }
 }
 
+fn visibility_marker(vis: &Value) -> String {
+    if vis["$type"].as_str() != Some("LimitedVisibility") {
+        return String::new();
+    }
+    let names = |key: &str, field: &str| {
+        vis[key]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v[field].as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default()
+    };
+    let users = names("permittedUsers", "login");
+    let groups = names("permittedGroups", "name");
+    let mut parts = vec![];
+    if !users.is_empty() {
+        parts.push(format!("users={users}"));
+    }
+    if !groups.is_empty() {
+        parts.push(format!("groups={groups}"));
+    }
+    format!(" [locked: {}]", parts.join("; "))
+}
+
 fn print_comments(c: &Client, id: &str) -> Result<()> {
     let comments = c.get(
         &format!("issues/{id}/comments"),
@@ -890,9 +1056,11 @@ fn print_comments(c: &Client, id: &str) -> Result<()> {
     }
     for cm in &list {
         println!(
-            "[{} {}] {}",
+            "[{} {}] ({}){} {}",
             date(&cm["created"]),
             cm["author"]["login"].as_str().unwrap_or("?"),
+            cm["id"].as_str().unwrap_or("?"),
+            visibility_marker(&cm["visibility"]),
             cm["text"].as_str().unwrap_or("").trim_end()
         );
     }
@@ -1482,7 +1650,14 @@ fn run() -> Result<()> {
         Cmd::Write {
             cmd:
                 WriteCmd::Issue {
-                    cmd: WriteIssueCmd::Comment { id, text },
+                    cmd:
+                        WriteIssueCmd::Comment {
+                            id,
+                            text,
+                            public,
+                            group,
+                            user,
+                        },
                 },
         } => {
             let text = match text {
@@ -1492,8 +1667,42 @@ fn run() -> Result<()> {
             if text.is_empty() {
                 bail!("empty comment");
             }
-            c.post(&format!("issues/{id}/comments"), &[], json!({"text": text}))?;
+            let mut body = json!({"text": text});
+            if public || !group.is_empty() || !user.is_empty() {
+                body["visibility"] = resolve_visibility(&c, public, &group, &user)?;
+            }
+            c.post(&format!("issues/{id}/comments"), &[], body)?;
             println!("ok");
+        }
+        Cmd::Write {
+            cmd:
+                WriteCmd::Issue {
+                    cmd:
+                        WriteIssueCmd::CommentVisibility {
+                            issue,
+                            comment_id,
+                            public,
+                            group,
+                            user,
+                        },
+                },
+        } => {
+            let vis = resolve_visibility(&c, public, &group, &user)?;
+            c.post(
+                &format!("issues/{issue}/comments/{comment_id}"),
+                &[("fields", "id")],
+                json!({"visibility": vis}),
+            )?;
+            let cm = c.get(
+                &format!("issues/{issue}/comments/{comment_id}"),
+                &[("fields", COMMENT_FIELDS)],
+            )?;
+            let marker = visibility_marker(&cm["visibility"]);
+            if marker.is_empty() {
+                println!("{comment_id} public");
+            } else {
+                println!("{comment_id}{marker}");
+            }
         }
         Cmd::Read {
             cmd: ReadCmd::Issue {
@@ -1791,6 +2000,24 @@ fn run() -> Result<()> {
                 );
             }
         }
+        Cmd::Read {
+            cmd:
+                ReadCmd::Api {
+                    path,
+                    fields,
+                    query,
+                    top,
+                    skip,
+                },
+        } => {
+            let params = api_params(fields.as_deref(), &query, top, skip)?;
+            let refs: Vec<(&str, &str)> = params
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let v = c.get(path.trim_start_matches('/'), &refs)?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
         // Local-only commands handled in `run_local` before the client resolves.
         Cmd::Completions { .. }
         | Cmd::Read {
@@ -1821,6 +2048,112 @@ fn main() {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ---- comment visibility ----
+
+    #[test]
+    fn visibility_marker_unlimited_is_empty() {
+        assert_eq!(
+            visibility_marker(&json!({"$type": "UnlimitedVisibility"})),
+            ""
+        );
+        assert_eq!(visibility_marker(&Value::Null), "");
+    }
+
+    #[test]
+    fn visibility_marker_limited_lists_users_and_groups() {
+        let vis = json!({
+            "$type": "LimitedVisibility",
+            "permittedUsers": [{"login": "alice"}],
+            "permittedGroups": [{"name": "devs"}]
+        });
+        assert_eq!(
+            visibility_marker(&vis),
+            " [locked: users=alice; groups=devs]"
+        );
+    }
+
+    #[test]
+    fn visibility_payload_public_is_unlimited() {
+        assert_eq!(
+            visibility_payload(true, &[], &[]),
+            json!({"$type": "UnlimitedVisibility"})
+        );
+    }
+
+    #[test]
+    fn visibility_payload_groups_and_users() {
+        assert_eq!(
+            visibility_payload(false, &["3-1".into()], &["1-2".into(), "1-3".into()]),
+            json!({
+                "$type": "LimitedVisibility",
+                "permittedGroups": [{"id": "3-1"}],
+                "permittedUsers": [{"id": "1-2"}, {"id": "1-3"}]
+            })
+        );
+        assert_eq!(
+            visibility_payload(false, &["3-1".into()], &[]),
+            json!({"$type": "LimitedVisibility", "permittedGroups": [{"id": "3-1"}]})
+        );
+    }
+
+    #[test]
+    fn comment_visibility_requires_one_flag_and_rejects_public_with_group() {
+        assert!(
+            Cli::try_parse_from(["yt", "write", "issue", "comment-visibility", "X-1", "4-2"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "yt",
+            "write",
+            "issue",
+            "comment-visibility",
+            "X-1",
+            "4-2",
+            "--public",
+            "--group",
+            "devs"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "yt",
+            "write",
+            "issue",
+            "comment-visibility",
+            "X-1",
+            "4-2",
+            "--public"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "yt",
+            "write",
+            "issue",
+            "comment-visibility",
+            "X-1",
+            "4-2",
+            "--group",
+            "devs",
+            "--user",
+            "alice",
+            "--user",
+            "bob"
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn comment_create_visibility_flags_optional_but_exclusive() {
+        assert!(Cli::try_parse_from(["yt", "write", "issue", "comment", "X-1", "hi"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "yt", "write", "issue", "comment", "X-1", "hi", "--group", "devs"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "yt", "write", "issue", "comment", "X-1", "hi", "--public", "--user", "alice"
+        ])
+        .is_err());
+    }
 
     // ---- URL normalization ----
 
@@ -2296,6 +2629,45 @@ mod tests {
             open[0].clone(),
             ("MERGED".to_string(), None)
         ]));
+    }
+
+    // ---- raw api passthrough ----
+
+    #[test]
+    fn api_params_assembles_all_kinds() {
+        let params = api_params(
+            Some("id,name"),
+            &["customFields=State".into(), "query=project: DEMO".into()],
+            Some(5),
+            Some(10),
+        )
+        .unwrap();
+        assert_eq!(
+            params,
+            vec![
+                ("fields".to_string(), "id,name".to_string()),
+                ("customFields".to_string(), "State".to_string()),
+                ("query".to_string(), "project: DEMO".to_string()),
+                ("$top".to_string(), "5".to_string()),
+                ("$skip".to_string(), "10".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn api_params_empty_inputs_yield_no_params() {
+        assert!(api_params(None, &[], None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn api_params_query_value_may_contain_equals() {
+        let params = api_params(None, &["a=b=c".into()], None, None).unwrap();
+        assert_eq!(params, vec![("a".to_string(), "b=c".to_string())]);
+    }
+
+    #[test]
+    fn api_params_rejects_query_without_equals() {
+        assert!(api_params(None, &["noequals".into()], None, None).is_err());
     }
 
     // ---- self-update helpers ----
