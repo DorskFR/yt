@@ -1225,22 +1225,30 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn newest_semver_tag(releases: &Value) -> Option<(String, String)> {
+    releases
+        .as_array()?
+        .iter()
+        .filter_map(|r| {
+            let tag = r["tag_name"].as_str()?;
+            parse_version(tag).map(|v| (v, tag))
+        })
+        .max_by_key(|(v, _)| *v)
+        .map(|(_, tag)| (tag.to_string(), tag.trim_start_matches('v').to_string()))
+}
+
 /// Query GitHub for the latest release; returns (tag, version-without-v).
+/// Cannot use /releases/latest: the rolling `latest` release shadows it.
 /// Time-boxed; any failure is an error the caller can swallow.
 fn fetch_latest_release() -> Result<(String, String)> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=20");
     let res = ureq::get(&url)
         .set("User-Agent", &format!("yt/{}", env!("CARGO_PKG_VERSION")))
         .set("Accept", "application/vnd.github+json")
         .timeout(std::time::Duration::from_secs(4))
         .call();
     let v = read(res)?;
-    let tag = v["tag_name"]
-        .as_str()
-        .context("release has no tag_name")?
-        .to_string();
-    let version = tag.trim_start_matches('v').to_string();
-    Ok((tag, version))
+    newest_semver_tag(&v).context("no semver release found")
 }
 
 /// Best-effort: print a one-line notice to stderr when a newer release exists.
@@ -2853,6 +2861,23 @@ mod tests {
         assert!(is_newer("v0.7.0", "0.6.1"));
         // unparseable => not newer (fail safe)
         assert!(!is_newer("garbage", "0.6.1"));
+    }
+
+    #[test]
+    fn newest_semver_tag_skips_rolling_latest() {
+        let releases = json!([
+            {"tag_name": "latest"},
+            {"tag_name": "v0.13.0"},
+            {"tag_name": "v0.14.0"},
+            {"tag_name": "v0.9.0"},
+        ]);
+        assert_eq!(
+            newest_semver_tag(&releases),
+            Some(("v0.14.0".into(), "0.14.0".into()))
+        );
+        assert_eq!(newest_semver_tag(&json!([{"tag_name": "latest"}])), None);
+        assert_eq!(newest_semver_tag(&json!([])), None);
+        assert_eq!(newest_semver_tag(&Value::Null), None);
     }
 
     #[test]

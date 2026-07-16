@@ -102,6 +102,7 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
+          make_latest: "true"
           files: |
             dist/yt-*
             dist/SHA256SUMS
@@ -117,6 +118,7 @@ jobs:
           gh release create latest \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
+            --latest=false \
             --title "latest (${{ steps.tag.outputs.tag }})" \
             --notes "Rolling pointer to the most recent release (${{ steps.tag.outputs.tag }})." \
             dist/yt-* dist/SHA256SUMS
