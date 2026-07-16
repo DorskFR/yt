@@ -11,6 +11,12 @@ const COMMENT_FIELDS: &str =
     "id,author(login),created,text,visibility($type,permittedGroups(name),permittedUsers(login))";
 const LINK_FIELDS: &str =
     "id,direction,linkType(name,sourceToTarget,targetToSource),issues(idReadable,summary)";
+// --json field sets must carry entity `id`s so results can feed `yt write`.
+const LIST_FIELDS_JSON: &str = "id,idReadable,summary,created,updated,reporter(id,login),customFields(id,name,value(id,name,login,text))";
+const ISSUE_FIELDS_JSON: &str = "id,idReadable,summary,description,created,updated,reporter(id,login),customFields(id,name,value(id,name,login,text))";
+const COMMENT_FIELDS_JSON: &str = "id,author(id,login),created,updated,text,visibility($type,permittedGroups(id,name),permittedUsers(id,login))";
+const LINK_FIELDS_JSON: &str =
+    "id,direction,linkType(id,name,sourceToTarget,targetToSource),issues(id,idReadable,summary)";
 // Pull requests surface in the activity stream under PullRequestChangeCategory
 // (the vcsChanges collection only holds bare commits for the GitHub integration).
 // Each PullRequestChange carries a PullRequestState whose *id* is the enum value
@@ -45,6 +51,9 @@ struct Cli {
 enum Cmd {
     /// Read-only operations (guard prefix: `yt read`)
     Read {
+        /// Print the raw API JSON instead of the text format
+        #[arg(long, global = true)]
+        json: bool,
         #[command(subcommand)]
         cmd: ReadCmd,
     },
@@ -680,6 +689,11 @@ fn prio_style(s: &str) -> Style {
     } else {
         Style::new()
     }
+}
+
+fn print_json(v: &Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
 }
 
 fn stdin_text() -> Result<String> {
@@ -1364,6 +1378,7 @@ fn run_local(cmd: &Cmd) -> Result<bool> {
         }
         Cmd::Read {
             cmd: ReadCmd::QueryHelp,
+            ..
         } => println!("{QUERY_HELP}"),
         Cmd::Write {
             cmd: WriteCmd::Update { force },
@@ -1372,6 +1387,7 @@ fn run_local(cmd: &Cmd) -> Result<bool> {
             cmd: ReadCmd::Server {
                 cmd: ReadServerCmd::Ls,
             },
+            ..
         } => {
             let cfg = Config::load()?;
             if cfg.servers.is_empty() {
@@ -1446,6 +1462,7 @@ fn run() -> Result<()> {
     // query-help, server config) were handled by `run_local` above.
     match cli.cmd {
         Cmd::Read {
+            json,
             cmd:
                 ReadCmd::Issue {
                     cmd:
@@ -1457,10 +1474,11 @@ fn run() -> Result<()> {
                         },
                 },
         } => {
+            let base = if json { LIST_FIELDS_JSON } else { LIST_FIELDS };
             let fields = if full {
-                format!("{LIST_FIELDS},description")
+                format!("{base},description")
             } else {
-                LIST_FIELDS.into()
+                base.into()
             };
             let issues = c.get(
                 "issues",
@@ -1485,6 +1503,13 @@ fn run() -> Result<()> {
             } else {
                 fetched.clone()
             };
+            if json {
+                print_json(&Value::Array(list))?;
+                if fetched.len() == limit {
+                    eprintln!("# limit {limit} reached; refine query or raise -n");
+                }
+                return Ok(());
+            }
             if list.is_empty() {
                 println!("no matches");
                 return Ok(());
@@ -1514,12 +1539,18 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Read {
+            json,
             cmd:
                 ReadCmd::Issue {
                     cmd: ReadIssueCmd::Show { id, comments, pr },
                 },
         } => {
-            let i = c.get(&format!("issues/{id}"), &[("fields", ISSUE_FIELDS)])?;
+            let fields = if json { ISSUE_FIELDS_JSON } else { ISSUE_FIELDS };
+            let i = c.get(&format!("issues/{id}"), &[("fields", fields)])?;
+            if json {
+                print_json(&i)?;
+                return Ok(());
+            }
             let ids = id_style();
             anstream::println!(
                 "{ids}{}{ids:#}  {}",
@@ -1705,15 +1736,34 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Read {
+            json,
             cmd: ReadCmd::Issue {
                 cmd: ReadIssueCmd::Comments { id },
             },
-        } => print_comments(&c, &id)?,
+        } => {
+            if json {
+                let comments = c.get(
+                    &format!("issues/{id}/comments"),
+                    &[("fields", COMMENT_FIELDS_JSON)],
+                )?;
+                print_json(&comments)?;
+            } else {
+                print_comments(&c, &id)?;
+            }
+        }
         Cmd::Read {
+            json,
             cmd: ReadCmd::Issue {
                 cmd: ReadIssueCmd::Links { id },
             },
-        } => print_links(&c, &id)?,
+        } => {
+            if json {
+                let links = c.get(&format!("issues/{id}/links"), &[("fields", LINK_FIELDS_JSON)])?;
+                print_json(&links)?;
+            } else {
+                print_links(&c, &id)?;
+            }
+        }
         Cmd::Write {
             cmd:
                 WriteCmd::Issue {
@@ -1740,15 +1790,22 @@ fn run() -> Result<()> {
             println!("{id} unlinked {target}");
         }
         Cmd::Read {
+            json,
             cmd:
                 ReadCmd::Issue {
                     cmd: ReadIssueCmd::Attachments { id, out },
                 },
         } => {
-            let atts = c.get(
-                &format!("issues/{id}/attachments"),
-                &[("fields", "id,name,size,url")],
-            )?;
+            let fields = if json {
+                "id,name,size,mimeType,created,author(id,login),url"
+            } else {
+                "id,name,size,url"
+            };
+            let atts = c.get(&format!("issues/{id}/attachments"), &[("fields", fields)])?;
+            if json {
+                print_json(&atts)?;
+                return Ok(());
+            }
             let list = atts.as_array().cloned().unwrap_or_default();
             if list.is_empty() {
                 println!("no attachments");
@@ -1818,11 +1875,16 @@ fn run() -> Result<()> {
             println!("ok");
         }
         Cmd::Read {
+            json,
             cmd: ReadCmd::Issue {
                 cmd: ReadIssueCmd::Tags,
             },
         } => {
             let tags = c.get("tags", &[("fields", "id,name"), ("$top", "500")])?;
+            if json {
+                print_json(&tags)?;
+                return Ok(());
+            }
             let list = tags.as_array().cloned().unwrap_or_default();
             if list.is_empty() {
                 println!("no tags");
@@ -1852,14 +1914,21 @@ fn run() -> Result<()> {
             println!("ok");
         }
         Cmd::Read {
+            json,
             cmd: ReadCmd::Project {
                 cmd: ReadProjectCmd::Ls,
             },
         } => {
-            let projects = c.get(
-                "admin/projects",
-                &[("fields", "shortName,name,archived"), ("$top", "500")],
-            )?;
+            let fields = if json {
+                "id,shortName,name,archived"
+            } else {
+                "shortName,name,archived"
+            };
+            let projects = c.get("admin/projects", &[("fields", fields), ("$top", "500")])?;
+            if json {
+                print_json(&projects)?;
+                return Ok(());
+            }
             for p in projects.as_array().into_iter().flatten() {
                 if p["archived"].as_bool() != Some(true) {
                     println!(
@@ -1893,22 +1962,26 @@ fn run() -> Result<()> {
             );
         }
         Cmd::Read {
+            json,
             cmd:
                 ReadCmd::Project {
                     cmd: ReadProjectCmd::Fields { project },
                 },
         } => {
             let (pid, short) = resolve_project(&c, &project)?;
+            let field_spec = if json {
+                "id,canBeEmpty,field(id,name,fieldType(id,valueType)),bundle(id,values(id,name,archived))"
+            } else {
+                "canBeEmpty,field(name,fieldType(valueType)),bundle(values(name,archived))"
+            };
             let fields = c.get(
                 &format!("admin/projects/{pid}/customFields"),
-                &[
-                    (
-                        "fields",
-                        "canBeEmpty,field(name,fieldType(valueType)),bundle(values(name,archived))",
-                    ),
-                    ("$top", "100"),
-                ],
+                &[("fields", field_spec), ("$top", "100")],
             )?;
+            if json {
+                print_json(&fields)?;
+                return Ok(());
+            }
             let field_list = fields.as_array().cloned().unwrap_or_default();
             if field_list.is_empty() {
                 // field config needs project-admin rights; fall back to values observed on recent issues
@@ -1967,11 +2040,21 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Read {
+            json,
             cmd: ReadCmd::User {
                 cmd: ReadUserCmd::Me,
             },
         } => {
-            let u = c.get("users/me", &[("fields", "login,name,email")])?;
+            let fields = if json {
+                "id,login,name,email"
+            } else {
+                "login,name,email"
+            };
+            let u = c.get("users/me", &[("fields", fields)])?;
+            if json {
+                print_json(&u)?;
+                return Ok(());
+            }
             println!(
                 "{}  {}  {}",
                 u["login"].as_str().unwrap_or("?"),
@@ -1980,14 +2063,20 @@ fn run() -> Result<()> {
             );
         }
         Cmd::Read {
+            json,
             cmd: ReadCmd::User {
                 cmd: ReadUserCmd::Ls { query },
             },
         } => {
+            let fields = if json { "id,login,name,email" } else { "login,name" };
             let users = c.get(
                 "users",
-                &[("query", &query), ("fields", "login,name"), ("$top", "10")],
+                &[("query", &query), ("fields", fields), ("$top", "10")],
             )?;
+            if json {
+                print_json(&users)?;
+                return Ok(());
+            }
             let list = users.as_array().cloned().unwrap_or_default();
             if list.is_empty() {
                 println!("no matches");
@@ -2009,6 +2098,7 @@ fn run() -> Result<()> {
                     top,
                     skip,
                 },
+            ..
         } => {
             let params = api_params(fields.as_deref(), &query, top, skip)?;
             let refs: Vec<(&str, &str)> = params
@@ -2022,9 +2112,11 @@ fn run() -> Result<()> {
         Cmd::Completions { .. }
         | Cmd::Read {
             cmd: ReadCmd::QueryHelp,
+            ..
         }
         | Cmd::Read {
             cmd: ReadCmd::Server { .. },
+            ..
         }
         | Cmd::Write {
             cmd: WriteCmd::Update { .. },
@@ -2153,6 +2245,54 @@ mod tests {
             "yt", "write", "issue", "comment", "X-1", "hi", "--public", "--user", "alice"
         ])
         .is_err());
+    }
+
+    // ---- json output mode ----
+
+    fn read_json_flag(args: &[&str]) -> bool {
+        match Cli::try_parse_from(args).unwrap().cmd {
+            Cmd::Read { json, .. } => json,
+            _ => panic!("not a read command"),
+        }
+    }
+
+    #[test]
+    fn json_flag_is_global_on_read_subtree() {
+        assert!(read_json_flag(&[
+            "yt",
+            "read",
+            "issue",
+            "ls",
+            "--json",
+            "project: DEMO"
+        ]));
+        assert!(read_json_flag(&[
+            "yt", "read", "--json", "issue", "comments", "DEMO-1"
+        ]));
+        assert!(read_json_flag(&["yt", "read", "project", "ls", "--json"]));
+        assert!(read_json_flag(&["yt", "read", "user", "ls", "alice", "--json"]));
+        assert!(!read_json_flag(&["yt", "read", "issue", "ls", "project: DEMO"]));
+        assert!(read_json_flag(&["yt", "read", "api", "tags", "--json"]));
+    }
+
+    #[test]
+    fn json_flag_rejected_on_write_subtree() {
+        assert!(Cli::try_parse_from(["yt", "write", "issue", "tag", "X-1", "t", "--json"]).is_err());
+    }
+
+    #[test]
+    fn json_field_sets_include_ids() {
+        for f in [
+            LIST_FIELDS_JSON,
+            ISSUE_FIELDS_JSON,
+            COMMENT_FIELDS_JSON,
+            LINK_FIELDS_JSON,
+        ] {
+            assert!(f.starts_with("id,"), "{f} must start with id");
+        }
+        assert!(LIST_FIELDS_JSON.contains("idReadable"));
+        assert!(ISSUE_FIELDS_JSON.contains("idReadable"));
+        assert!(COMMENT_FIELDS_JSON.contains("visibility($type"));
     }
 
     // ---- URL normalization ----
