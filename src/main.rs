@@ -378,7 +378,7 @@ impl Config {
                     // single configured server is unambiguous
                     (self.servers.len() == 1).then(|| self.servers.keys().next().unwrap().clone())
                 })
-                .context("no server selected: set a default with `yt default NAME`, pass --server, or set YOUTRACK_URL"),
+                .context("no server selected: set a default with `yt write server default NAME`, pass --server, or set YOUTRACK_URL"),
         }
     }
 
@@ -436,7 +436,7 @@ impl Client {
                 let cfg = Config::load()?;
                 let name = cfg.select_server(server)?;
                 let (u, t) = cfg.servers.get(&name).with_context(|| {
-                    format!("no server named '{name}': run `yt auth URL TOKEN {name}`")
+                    format!("no server named '{name}': run `yt write server auth URL TOKEN {name}`")
                 })?;
                 (u.clone(), t.clone())
             }
@@ -1172,9 +1172,9 @@ const QUERY_HELP: &str = "YouTrack query syntax:
   sort by: updated desc     sort by: priority asc
 Terms combine with AND by default; use 'or' explicitly.
 Examples:
-  yt ls \"project: DEMO #Unresolved sort by: updated desc\"
-  yt ls \"project: DEMO State: -Done assignee: me\"
-  yt cmd \"State {In Progress} assignee me\" DEMO-12";
+  yt read issue ls \"project: DEMO #Unresolved sort by: updated desc\"
+  yt read issue ls \"project: DEMO State: -Done assignee: me\"
+  yt write issue cmd \"State {In Progress} assignee me\" DEMO-12";
 
 // --- self-update / update notice -----------------------------------------
 
@@ -1286,7 +1286,7 @@ fn maybe_print_update_notice() {
     }
 
     if !latest.is_empty() && is_newer(&latest, current) {
-        eprintln!("update available: {current} -> {latest} (run: yt update)");
+        eprintln!("update available: {current} -> {latest} (run: yt write update)");
     }
 }
 
@@ -2888,5 +2888,115 @@ mod tests {
         assert_eq!(content_type("a.svg"), "image/svg+xml");
         assert_eq!(content_type("a.bin"), "application/octet-stream");
         assert_eq!(content_type("noext"), "application/octet-stream");
+    }
+
+    fn subcommand_paths(cmd: &clap::Command, prefix: &[String], out: &mut Vec<Vec<String>>) {
+        for sub in cmd.get_subcommands() {
+            let mut path = prefix.to_vec();
+            path.push(sub.get_name().to_string());
+            out.push(path.clone());
+            subcommand_paths(sub, &path, out);
+        }
+    }
+
+    fn help_strings(cmd: &clap::Command, out: &mut Vec<String>) {
+        for s in [
+            cmd.get_about(),
+            cmd.get_long_about(),
+            cmd.get_before_help(),
+            cmd.get_after_help(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.push(s.to_string());
+        }
+        for arg in cmd.get_arguments() {
+            for s in [arg.get_help(), arg.get_long_help()].into_iter().flatten() {
+                out.push(s.to_string());
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            help_strings(sub, out);
+        }
+    }
+
+    fn is_command_word(tok: &str) -> bool {
+        !tok.is_empty() && tok.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+    }
+
+    fn stale_yt_references(text: &str, paths: &[Vec<String>]) -> Vec<String> {
+        let mut stale = Vec::new();
+        for (idx, _) in text.match_indices("yt ") {
+            let before = &text[..idx];
+            if before.chars().last().is_some_and(|c| c.is_alphanumeric()) {
+                continue;
+            }
+            let strict = matches!(
+                before.trim_end_matches(' ').chars().last(),
+                None | Some('`' | '"' | ':' | '\n')
+            );
+            let rest = &text[idx + 3..];
+            let mut tokens: Vec<&str> = Vec::new();
+            for seg in rest.split(' ') {
+                let word = seg.trim_end_matches(|c: char| !c.is_ascii_lowercase() && c != '-');
+                if !is_command_word(word) {
+                    break;
+                }
+                tokens.push(word);
+                if word.len() != seg.len() {
+                    break;
+                }
+            }
+            let is_top_level = tokens
+                .first()
+                .is_some_and(|t| paths.iter().any(|p| p.len() == 1 && p[0] == *t));
+            if !strict && !is_top_level {
+                continue;
+            }
+            let mut walked: Vec<String> = Vec::new();
+            for tok in tokens {
+                let candidate: Vec<String> = walked
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(tok.to_string()))
+                    .collect();
+                if paths.contains(&candidate) {
+                    walked = candidate;
+                } else if walked.is_empty()
+                    || paths
+                        .iter()
+                        .any(|p| p.starts_with(&walked) && p.len() > walked.len())
+                {
+                    stale.push(format!(
+                        "yt {}",
+                        rest.split(['\n', '"', '`']).next().unwrap_or("").trim()
+                    ));
+                    break;
+                } else {
+                    break;
+                }
+            }
+        }
+        stale
+    }
+
+    #[test]
+    fn yt_command_references_resolve_to_real_subcommands() {
+        let cmd = Cli::command();
+        let mut paths = Vec::new();
+        subcommand_paths(&cmd, &[], &mut paths);
+        assert!(paths.iter().any(|p| p == &["read", "issue", "ls"]));
+
+        let mut texts = Vec::new();
+        help_strings(&cmd, &mut texts);
+        texts.push(QUERY_HELP.to_string());
+        texts.push(include_str!("main.rs").to_string());
+
+        let stale: Vec<String> = texts
+            .iter()
+            .flat_map(|t| stale_yt_references(t, &paths))
+            .collect();
+        assert!(stale.is_empty(), "stale command references: {stale:?}");
     }
 }
