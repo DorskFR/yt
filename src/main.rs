@@ -5,15 +5,15 @@ use clap_complete::Shell;
 use serde_json::{json, Value};
 use std::io::Read;
 
-const LIST_FIELDS: &str = "idReadable,summary,customFields(name,value(name,login,text))";
-const ISSUE_FIELDS: &str = "idReadable,summary,description,created,updated,reporter(login),customFields(name,value(name,login,text))";
+const LIST_FIELDS: &str = "idReadable,summary,tags(name),customFields(name,value(name,login,text))";
+const ISSUE_FIELDS: &str = "idReadable,summary,description,created,updated,reporter(login),tags(name),customFields(name,value(name,login,text))";
 const COMMENT_FIELDS: &str =
     "id,author(login),created,text,visibility($type,permittedGroups(name),permittedUsers(login))";
 const LINK_FIELDS: &str =
     "id,direction,linkType(name,sourceToTarget,targetToSource),issues(idReadable,summary)";
 // --json field sets must carry entity `id`s so results can feed `yt write`.
-const LIST_FIELDS_JSON: &str = "id,idReadable,summary,created,updated,reporter(id,login),customFields(id,name,value(id,name,login,text))";
-const ISSUE_FIELDS_JSON: &str = "id,idReadable,summary,description,created,updated,reporter(id,login),customFields(id,name,value(id,name,login,text))";
+const LIST_FIELDS_JSON: &str = "id,idReadable,summary,created,updated,reporter(id,login),tags(id,name),customFields(id,name,value(id,name,login,text))";
+const ISSUE_FIELDS_JSON: &str = "id,idReadable,summary,description,created,updated,reporter(id,login),tags(id,name),customFields(id,name,value(id,name,login,text))";
 const COMMENT_FIELDS_JSON: &str = "id,author(id,login),created,updated,text,visibility($type,permittedGroups(id,name),permittedUsers(id,login))";
 const LINK_FIELDS_JSON: &str =
     "id,direction,linkType(id,name,sourceToTarget,targetToSource),issues(id,idReadable,summary)";
@@ -131,6 +131,7 @@ enum ReadIssueCmd {
     },
     /// Show one issue
     Show {
+        /// Issue id, e.g. DEMO-1
         id: String,
         /// Include comments
         #[arg(short, long)]
@@ -141,31 +142,51 @@ enum ReadIssueCmd {
     },
     /// List an issue's attachments; -o DIR downloads them
     Attachments {
+        /// Issue id, e.g. DEMO-1
         id: String,
         /// Download all attachments to DIR (default: current directory)
         #[arg(short = 'o', long = "out")]
         out: Option<Option<String>>,
     },
     /// List an issue's comments
-    Comments { id: String },
+    Comments {
+        /// Issue id, e.g. DEMO-1
+        id: String,
+    },
     /// List an issue's links to other issues, grouped by relation
-    Links { id: String },
+    Links {
+        /// Issue id, e.g. DEMO-1
+        id: String,
+    },
     /// List tags (one name per line)
     Tags,
 }
 
 #[derive(Subcommand)]
 enum ReadProjectCmd {
-    /// List projects
-    Ls,
+    /// List projects (archived hidden unless --all)
+    Ls {
+        /// Include archived projects
+        #[arg(long)]
+        all: bool,
+    },
     /// Show a project's custom fields and allowed values
-    Fields { project: String },
+    Fields {
+        /// Project short name or name, e.g. DEMO
+        project: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum ReadUserCmd {
     /// Search users by name/login
-    Ls { query: String },
+    Ls {
+        /// Name or login fragment to search for
+        query: String,
+        /// Max results
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+    },
     /// Show the authenticated user
     Me,
 }
@@ -178,7 +199,7 @@ enum ReadServerCmd {
 
 #[derive(Subcommand)]
 enum WriteCmd {
-    /// Mutate issues (new, edit, attach, comment, link, unlink, cmd, tag, untag)
+    /// Mutate issues (new, edit, attach, comment, comment-visibility, link, unlink, cmd, tag, untag)
     Issue {
         #[command(subcommand)]
         cmd: WriteIssueCmd,
@@ -207,6 +228,7 @@ enum WriteIssueCmd {
     New {
         /// Project short name or name, e.g. DEMO
         project: String,
+        /// Issue summary (title)
         summary: String,
         /// Description ("-" reads stdin)
         #[arg(short, long)]
@@ -217,6 +239,7 @@ enum WriteIssueCmd {
     },
     /// Edit an issue's summary and/or description; prints the ID
     Edit {
+        /// Issue id, e.g. DEMO-1
         id: String,
         /// New summary
         #[arg(short, long)]
@@ -227,7 +250,9 @@ enum WriteIssueCmd {
     },
     /// Attach one or more files to an issue (or a comment with -c)
     Attach {
+        /// Issue id, e.g. DEMO-1
         id: String,
+        /// Files to upload (one or more)
         #[arg(required = true)]
         files: Vec<String>,
         /// Attach to a specific comment instead of the issue
@@ -236,7 +261,9 @@ enum WriteIssueCmd {
     },
     /// Add a comment (text arg, or stdin if omitted)
     Comment {
+        /// Issue id, e.g. DEMO-1
         id: String,
+        /// Comment text (reads stdin when omitted)
         text: Option<String>,
         /// Make the comment visible to everyone
         #[arg(long, conflicts_with_all = ["group", "user"])]
@@ -251,7 +278,9 @@ enum WriteIssueCmd {
     /// Change an existing comment's visibility; prints the resulting visibility
     #[command(group(clap::ArgGroup::new("vis").required(true).multiple(true)))]
     CommentVisibility {
+        /// Issue id, e.g. DEMO-1
         issue: String,
+        /// Comment id as printed in parentheses by `yt read issue comments` (e.g. 4-123)
         comment_id: String,
         /// Make the comment visible to everyone
         #[arg(long, group = "vis", conflicts_with_all = ["group", "user"])]
@@ -265,21 +294,28 @@ enum WriteIssueCmd {
     },
     /// Link two issues, e.g. yt write issue link YT-1 "relates to" YT-2 (run `yt read issue links <id>` for the phrases this server accepts)
     Link {
+        /// Issue id, e.g. DEMO-1
         id: String,
         /// Relation phrase, e.g. "relates to", "depends on", "subtask of"
         phrase: String,
+        /// Issue to link to, e.g. DEMO-2
         target: String,
     },
     /// Remove a link between two issues (same phrase as `yt write issue link`)
     Unlink {
+        /// Issue id, e.g. DEMO-1
         id: String,
+        /// Relation phrase used when the link was created, e.g. "relates to"
         phrase: String,
+        /// Linked issue to detach, e.g. DEMO-2
         target: String,
     },
     /// Apply a YouTrack command to issues, e.g. yt write issue cmd "State Fixed assignee me" DEMO-1 DEMO-2
     #[allow(clippy::enum_variant_names)]
     Cmd {
+        /// YouTrack command, e.g. "State Fixed assignee me"
         command: String,
+        /// Issue ids, readable (DEMO-1) or internal (2-123)
         #[arg(required = true)]
         ids: Vec<String>,
         /// Comment to add alongside the command
@@ -287,9 +323,19 @@ enum WriteIssueCmd {
         comment: Option<String>,
     },
     /// Add a tag (by name) to an issue
-    Tag { id: String, tag: String },
+    Tag {
+        /// Issue id, e.g. DEMO-1
+        id: String,
+        /// Tag name
+        tag: String,
+    },
     /// Remove a tag (by name) from an issue
-    Untag { id: String, tag: String },
+    Untag {
+        /// Issue id, e.g. DEMO-1
+        id: String,
+        /// Tag name
+        tag: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -532,8 +578,9 @@ impl Client {
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
         body.extend_from_slice(
             format!(
-                "Content-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\
-                 Content-Type: {ctype}\r\n\r\n"
+                "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n\
+                 Content-Type: {ctype}\r\n\r\n",
+                header_quote(name)
             )
             .as_bytes(),
         );
@@ -551,6 +598,25 @@ impl Client {
 }
 
 /// Infer a content-type from a file extension for common image types.
+fn header_quote(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '\r' && *c != '\n')
+        .flat_map(|c| match c {
+            '"' | '\\' => vec!['\\', c],
+            c => vec![c],
+        })
+        .collect()
+}
+
+fn safe_file_name(name: &str, fallback: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    if base.is_empty() || base == "." || base == ".." || base.chars().any(char::is_control) {
+        format!("attachment-{fallback}")
+    } else {
+        base.to_string()
+    }
+}
+
 fn content_type(name: &str) -> &'static str {
     match name
         .rsplit('.')
@@ -633,6 +699,25 @@ fn cf_value(v: &Value) -> Option<String> {
     }
 }
 
+fn tag_names(i: &Value) -> Vec<&str> {
+    i["tags"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t["name"].as_str())
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+fn tags_meta(i: &Value) -> Option<String> {
+    let names = tag_names(i);
+    (!names.is_empty()).then(|| format!("tags:{}", names.join(",")))
+}
+
+fn tags_suffix(i: &Value) -> String {
+    tag_names(i).iter().map(|n| format!(" #{n}")).collect()
+}
+
 fn cf_get(issue: &Value, name: &str) -> Option<String> {
     issue["customFields"]
         .as_array()?
@@ -694,6 +779,20 @@ fn prio_style(s: &str) -> Style {
 fn print_json(v: &Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
+}
+
+fn limit_hint(limit: usize) -> String {
+    format!("# limit {limit} reached; refine query or raise -n")
+}
+
+fn visible_projects(projects: &Value, all: bool) -> Vec<Value> {
+    projects
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| all || p["archived"].as_bool() != Some(true))
+        .cloned()
+        .collect()
 }
 
 fn stdin_text() -> Result<String> {
@@ -1007,6 +1106,38 @@ fn has_merged_pr(changes: &[(String, Option<String>)]) -> bool {
         .any(|(s, _)| s.eq_ignore_ascii_case("merged"))
 }
 
+/// Issue object for `show --json`: the fetched issue plus `links`, and
+/// `comments` / `pullRequests` when the matching flags were passed. Pure.
+fn show_json(
+    mut issue: Value,
+    links: Vec<Value>,
+    comments: Option<Value>,
+    prs: Option<&[(String, Option<String>)]>,
+) -> Value {
+    issue["links"] = Value::Array(links);
+    if let Some(cm) = comments {
+        issue["comments"] = cm;
+    }
+    if let Some(prs) = prs {
+        issue["pullRequests"] = prs
+            .iter()
+            .map(|(state, url)| json!({"state": state, "url": url}))
+            .collect();
+    }
+    issue
+}
+
+/// `server ls --json` records: name, url, default flag. Tokens never leave the
+/// config. Pure.
+fn servers_json(cfg: &Config) -> Value {
+    cfg.servers
+        .iter()
+        .map(|(name, (url, _))| {
+            json!({"name": name, "url": url, "default": cfg.default.as_deref() == Some(name)})
+        })
+        .collect()
+}
+
 /// Fetch an issue's pull-request state changes from the activity stream, as
 /// (state, optional url) tuples. One small request scoped to the PR category.
 fn fetch_pr_changes(c: &Client, id: &str) -> Result<Vec<(String, Option<String>)>> {
@@ -1092,8 +1223,8 @@ fn link_phrase(group: &Value) -> &str {
 }
 
 /// Fetch an issue's links, keeping only groups that actually contain issues.
-fn fetch_links(c: &Client, id: &str) -> Result<Vec<Value>> {
-    let links = c.get(&format!("issues/{id}/links"), &[("fields", LINK_FIELDS)])?;
+fn fetch_links(c: &Client, id: &str, fields: &str) -> Result<Vec<Value>> {
+    let links = c.get(&format!("issues/{id}/links"), &[("fields", fields)])?;
     Ok(links
         .as_array()
         .into_iter()
@@ -1120,7 +1251,7 @@ fn print_link_groups(groups: &[Value]) {
 
 /// Print an issue's links, one linked issue per line: `phrase  ID  summary`.
 fn print_links(c: &Client, id: &str) -> Result<()> {
-    let groups = fetch_links(c, id)?;
+    let groups = fetch_links(c, id, LINK_FIELDS)?;
     if groups.is_empty() {
         println!("no links");
         return Ok(());
@@ -1385,19 +1516,29 @@ fn run_local(cmd: &Cmd) -> Result<bool> {
             clap_complete::generate(*shell, &mut command, name, &mut anstream::stdout());
         }
         Cmd::Read {
+            json,
             cmd: ReadCmd::QueryHelp,
-            ..
-        } => println!("{QUERY_HELP}"),
+        } => {
+            if *json {
+                print_json(&json!({"text": QUERY_HELP}))?;
+            } else {
+                println!("{QUERY_HELP}");
+            }
+        }
         Cmd::Write {
             cmd: WriteCmd::Update { force },
         } => self_update(*force)?,
         Cmd::Read {
+            json,
             cmd: ReadCmd::Server {
                 cmd: ReadServerCmd::Ls,
             },
-            ..
         } => {
             let cfg = Config::load()?;
+            if *json {
+                print_json(&servers_json(&cfg))?;
+                return Ok(true);
+            }
             if cfg.servers.is_empty() {
                 println!("no servers configured; run `yt write server auth URL TOKEN [name]`");
             }
@@ -1514,7 +1655,7 @@ fn run() -> Result<()> {
             if json {
                 print_json(&Value::Array(list))?;
                 if fetched.len() == limit {
-                    eprintln!("# limit {limit} reached; refine query or raise -n");
+                    eprintln!("{}", limit_hint(limit));
                 }
                 return Ok(());
             }
@@ -1530,8 +1671,9 @@ fn run() -> Result<()> {
                 let prio = prio.as_deref().unwrap_or("-");
                 let (ids, ss, ps) = (id_style(), state_style(state), prio_style(prio));
                 anstream::println!(
-                    "{ids}{id}{ids:#}  {ss}{state}{ss:#}  {ps}{prio}{ps:#}  {}",
-                    i["summary"].as_str().unwrap_or("")
+                    "{ids}{id}{ids:#}  {ss}{state}{ss:#}  {ps}{prio}{ps:#}  {}{}",
+                    i["summary"].as_str().unwrap_or(""),
+                    tags_suffix(i)
                 );
                 if full {
                     if let Some(d) = i["description"].as_str().filter(|d| !d.is_empty()) {
@@ -1543,7 +1685,7 @@ fn run() -> Result<()> {
                 }
             }
             if fetched.len() == limit {
-                println!("# limit {limit} reached; refine query or raise -n");
+                eprintln!("{}", limit_hint(limit));
             }
         }
         Cmd::Read {
@@ -1560,7 +1702,22 @@ fn run() -> Result<()> {
             };
             let i = c.get(&format!("issues/{id}"), &[("fields", fields)])?;
             if json {
-                print_json(&i)?;
+                let rid = i["idReadable"].as_str().unwrap_or(&id).to_string();
+                let links = fetch_links(&c, &rid, LINK_FIELDS_JSON)?;
+                let cm = if comments {
+                    Some(c.get(
+                        &format!("issues/{rid}/comments"),
+                        &[("fields", COMMENT_FIELDS_JSON)],
+                    )?)
+                } else {
+                    None
+                };
+                let prs = if pr {
+                    Some(fetch_pr_changes(&c, &rid)?)
+                } else {
+                    None
+                };
+                print_json(&show_json(i, links, cm, prs.as_deref()))?;
                 return Ok(());
             }
             let ids = id_style();
@@ -1586,6 +1743,9 @@ fn run() -> Result<()> {
             if let Some(r) = i["reporter"]["login"].as_str() {
                 meta.push(format!("by:{r}"));
             }
+            if let Some(t) = tags_meta(&i) {
+                meta.push(t);
+            }
             println!("{}", meta.join("  "));
             let link = Style::new()
                 .underline()
@@ -1597,7 +1757,7 @@ fn run() -> Result<()> {
             if let Some(d) = i["description"].as_str().filter(|d| !d.is_empty()) {
                 println!("\n{}", d.trim_end());
             }
-            let links = fetch_links(&c, i["idReadable"].as_str().unwrap_or(&id))?;
+            let links = fetch_links(&c, i["idReadable"].as_str().unwrap_or(&id), LINK_FIELDS)?;
             if !links.is_empty() {
                 println!("\n-- links --");
                 print_link_groups(&links);
@@ -1840,12 +2000,13 @@ fn run() -> Result<()> {
                     let dir = dir.as_deref().unwrap_or(".");
                     std::fs::create_dir_all(dir)?;
                     for a in &list {
-                        let name = a["name"].as_str().unwrap_or("attachment");
+                        let id = a["id"].as_str().unwrap_or("unknown");
+                        let name = safe_file_name(a["name"].as_str().unwrap_or(""), id);
                         let url = a["url"]
                             .as_str()
                             .with_context(|| format!("attachment '{name}' has no url"))?;
                         let bytes = c.get_bytes(url)?;
-                        let path = std::path::Path::new(dir).join(name);
+                        let path = std::path::Path::new(dir).join(&name);
                         std::fs::write(&path, &bytes)?;
                         println!("{}  {}", path.display(), bytes.len());
                     }
@@ -1931,7 +2092,7 @@ fn run() -> Result<()> {
         Cmd::Read {
             json,
             cmd: ReadCmd::Project {
-                cmd: ReadProjectCmd::Ls,
+                cmd: ReadProjectCmd::Ls { all },
             },
         } => {
             let fields = if json {
@@ -1940,18 +2101,17 @@ fn run() -> Result<()> {
                 "shortName,name,archived"
             };
             let projects = c.get("admin/projects", &[("fields", fields), ("$top", "500")])?;
+            let list = visible_projects(&projects, all);
             if json {
-                print_json(&projects)?;
+                print_json(&Value::Array(list))?;
                 return Ok(());
             }
-            for p in projects.as_array().into_iter().flatten() {
-                if p["archived"].as_bool() != Some(true) {
-                    println!(
-                        "{}  {}",
-                        p["shortName"].as_str().unwrap_or("?"),
-                        p["name"].as_str().unwrap_or("")
-                    );
-                }
+            for p in &list {
+                println!(
+                    "{}  {}",
+                    p["shortName"].as_str().unwrap_or("?"),
+                    p["name"].as_str().unwrap_or("")
+                );
             }
         }
         Cmd::Write {
@@ -2079,33 +2239,38 @@ fn run() -> Result<()> {
         }
         Cmd::Read {
             json,
-            cmd: ReadCmd::User {
-                cmd: ReadUserCmd::Ls { query },
-            },
+            cmd:
+                ReadCmd::User {
+                    cmd: ReadUserCmd::Ls { query, limit },
+                },
         } => {
             let fields = if json {
                 "id,login,name,email"
             } else {
                 "login,name"
             };
+            let top = limit.to_string();
             let users = c.get(
                 "users",
-                &[("query", &query), ("fields", fields), ("$top", "10")],
+                &[("query", &query), ("fields", fields), ("$top", &top)],
             )?;
+            let list = users.as_array().cloned().unwrap_or_default();
             if json {
                 print_json(&users)?;
-                return Ok(());
+            } else {
+                if list.is_empty() {
+                    println!("no matches");
+                }
+                for u in &list {
+                    println!(
+                        "{}  {}",
+                        u["login"].as_str().unwrap_or("?"),
+                        u["name"].as_str().unwrap_or("")
+                    );
+                }
             }
-            let list = users.as_array().cloned().unwrap_or_default();
-            if list.is_empty() {
-                println!("no matches");
-            }
-            for u in &list {
-                println!(
-                    "{}  {}",
-                    u["login"].as_str().unwrap_or("?"),
-                    u["name"].as_str().unwrap_or("")
-                );
+            if list.len() == limit {
+                eprintln!("{}", limit_hint(limit));
             }
         }
         Cmd::Read {
@@ -2159,6 +2324,61 @@ fn main() {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ---- issue tags ----
+
+    #[test]
+    fn tags_render_when_present() {
+        let i = json!({"tags": [{"name": "Blocked"}, {"name": "needs review"}]});
+        assert_eq!(tags_meta(&i).as_deref(), Some("tags:Blocked,needs review"));
+        assert_eq!(tags_suffix(&i), " #Blocked #needs review");
+    }
+
+    #[test]
+    fn tags_are_silent_when_absent() {
+        for i in [
+            json!({}),
+            json!({"tags": []}),
+            json!({"tags": [{"name": ""}]}),
+        ] {
+            assert_eq!(tags_meta(&i), None);
+            assert_eq!(tags_suffix(&i), "");
+        }
+    }
+
+    // ---- attachment file names ----
+
+    #[test]
+    fn safe_file_name_strips_traversal() {
+        assert_eq!(safe_file_name("../../etc/passwd", "1-2"), "passwd");
+        assert_eq!(safe_file_name("/etc/passwd", "1-2"), "passwd");
+        assert_eq!(safe_file_name("..\\x", "1-2"), "x");
+        assert_eq!(safe_file_name("C:\\dir\\report.pdf", "1-2"), "report.pdf");
+    }
+
+    #[test]
+    fn safe_file_name_falls_back_to_id() {
+        assert_eq!(safe_file_name("", "1-2"), "attachment-1-2");
+        assert_eq!(safe_file_name(".", "1-2"), "attachment-1-2");
+        assert_eq!(safe_file_name("..", "1-2"), "attachment-1-2");
+        assert_eq!(safe_file_name("a/..", "1-2"), "attachment-1-2");
+        assert_eq!(safe_file_name("dir/", "1-2"), "attachment-1-2");
+        assert_eq!(safe_file_name("bad\nname", "1-2"), "attachment-1-2");
+    }
+
+    #[test]
+    fn safe_file_name_keeps_normal_names() {
+        assert_eq!(safe_file_name("report.pdf", "1-2"), "report.pdf");
+        assert_eq!(safe_file_name("my file (1).png", "1-2"), "my file (1).png");
+    }
+
+    #[test]
+    fn header_quote_escapes_and_strips() {
+        assert_eq!(header_quote("plain.txt"), "plain.txt");
+        assert_eq!(header_quote("a\"b.txt"), "a\\\"b.txt");
+        assert_eq!(header_quote("a\\b.txt"), "a\\\\b.txt");
+        assert_eq!(header_quote("a\r\nb.txt"), "ab.txt");
+    }
 
     // ---- comment visibility ----
 
@@ -2254,6 +2474,33 @@ mod tests {
     }
 
     #[test]
+    fn visible_projects_hides_archived_unless_all() {
+        let projects = json!([
+            {"shortName": "A", "archived": false},
+            {"shortName": "B", "archived": true},
+            {"shortName": "C"}
+        ]);
+        let names = |all| -> Vec<String> {
+            visible_projects(&projects, all)
+                .iter()
+                .map(|p| p["shortName"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(names(false), ["A", "C"]);
+        assert_eq!(names(true), ["A", "B", "C"]);
+        assert!(visible_projects(&json!(null), true).is_empty());
+    }
+
+    #[test]
+    fn user_ls_and_project_ls_flags() {
+        assert!(Cli::try_parse_from(["yt", "read", "user", "ls", "bob"]).is_ok());
+        assert!(Cli::try_parse_from(["yt", "read", "user", "ls", "bob", "-n", "50"]).is_ok());
+        assert!(Cli::try_parse_from(["yt", "read", "user", "ls", "bob", "--limit", "x"]).is_err());
+        assert!(Cli::try_parse_from(["yt", "read", "project", "ls"]).is_ok());
+        assert!(Cli::try_parse_from(["yt", "read", "project", "ls", "--all"]).is_ok());
+    }
+
+    #[test]
     fn comment_create_visibility_flags_optional_but_exclusive() {
         assert!(Cli::try_parse_from(["yt", "write", "issue", "comment", "X-1", "hi"]).is_ok());
         assert!(Cli::try_parse_from([
@@ -2300,6 +2547,65 @@ mod tests {
             "project: DEMO"
         ]));
         assert!(read_json_flag(&["yt", "read", "api", "tags", "--json"]));
+    }
+
+    #[test]
+    fn json_flag_parses_on_show_flags_server_ls_and_query_help() {
+        assert!(read_json_flag(&[
+            "yt", "read", "--json", "issue", "show", "DEMO-1", "-c", "--pr"
+        ]));
+        assert!(read_json_flag(&["yt", "read", "--json", "server", "ls"]));
+        assert!(read_json_flag(&["yt", "read", "query-help", "--json"]));
+    }
+
+    #[test]
+    fn show_json_adds_links_and_optional_sections() {
+        let issue = json!({"id": "2-1", "idReadable": "DEMO-1"});
+        let links = vec![json!({"id": "l1", "issues": [{"idReadable": "DEMO-2"}]})];
+        let bare = show_json(issue.clone(), links.clone(), None, None);
+        assert_eq!(bare["idReadable"], "DEMO-1");
+        assert_eq!(bare["links"][0]["id"], "l1");
+        assert!(bare.get("comments").is_none());
+        assert!(bare.get("pullRequests").is_none());
+
+        let prs = vec![
+            ("OPEN".to_string(), Some("https://x/pr/1".to_string())),
+            ("MERGED".to_string(), None),
+        ];
+        let full = show_json(
+            issue,
+            links,
+            Some(json!([{"id": "c1", "text": "hi"}])),
+            Some(&prs),
+        );
+        assert_eq!(full["comments"][0]["text"], "hi");
+        assert_eq!(
+            full["pullRequests"],
+            json!([
+                {"state": "OPEN", "url": "https://x/pr/1"},
+                {"state": "MERGED", "url": null}
+            ])
+        );
+    }
+
+    #[test]
+    fn servers_json_marks_default_and_omits_token() {
+        let mut cfg = Config::default();
+        cfg.servers
+            .insert("a".into(), ("https://a.example".into(), "secret-a".into()));
+        cfg.servers
+            .insert("b".into(), ("https://b.example".into(), "secret-b".into()));
+        cfg.default = Some("b".into());
+        let v = servers_json(&cfg);
+        assert_eq!(
+            v,
+            json!([
+                {"name": "a", "url": "https://a.example", "default": false},
+                {"name": "b", "url": "https://b.example", "default": true}
+            ])
+        );
+        assert!(!v.to_string().contains("secret"));
+        assert_eq!(servers_json(&Config::default()), json!([]));
     }
 
     #[test]
@@ -2981,6 +3287,29 @@ mod tests {
         stale
     }
 
+    fn missing_help(cmd: &clap::Command, prefix: &[String], out: &mut Vec<String>) {
+        for arg in cmd.get_arguments() {
+            if arg.get_help().is_none() && arg.get_long_help().is_none() {
+                out.push(format!("{} <{}>", prefix.join(" "), arg.get_id()));
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            let mut path = prefix.to_vec();
+            path.push(sub.get_name().to_string());
+            if sub.get_about().is_none() && sub.get_long_about().is_none() {
+                out.push(path.join(" "));
+            }
+            missing_help(sub, &path, out);
+        }
+    }
+
+    #[test]
+    fn every_arg_and_subcommand_has_help() {
+        let mut missing = Vec::new();
+        missing_help(&Cli::command(), &["yt".to_string()], &mut missing);
+        assert!(missing.is_empty(), "missing help text: {missing:?}");
+    }
+
     #[test]
     fn yt_command_references_resolve_to_real_subcommands() {
         let cmd = Cli::command();
@@ -2998,5 +3327,20 @@ mod tests {
             .flat_map(|t| stale_yt_references(t, &paths))
             .collect();
         assert!(stale.is_empty(), "stale command references: {stale:?}");
+    }
+
+    #[test]
+    fn readme_documents_every_subcommand() {
+        let cmd = Cli::command();
+        let mut paths = Vec::new();
+        subcommand_paths(&cmd, &[], &mut paths);
+        let readme = include_str!("../README.md");
+        let missing: Vec<String> = paths
+            .iter()
+            .filter(|p| p.last().map(|s| s.as_str()) != Some("help"))
+            .map(|p| format!("yt {}", p.join(" ")))
+            .filter(|s| !readme.contains(s.as_str()))
+            .collect();
+        assert!(missing.is_empty(), "README.md lacks: {missing:?}");
     }
 }
