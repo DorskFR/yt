@@ -2488,14 +2488,17 @@ fn run() -> Result<()> {
             if json {
                 print_json(&open_json(rid, summary, &url))?;
             } else {
-                let ids = id_style();
-                let link = Style::new()
-                    .underline()
-                    .fg_color(Some(AnsiColor::Blue.into()));
+                let t = Theme::detect();
+                let (ids, link) = (t.id, t.url);
                 anstream::println!("{ids}{rid}{ids:#}  {summary}");
                 anstream::println!("{link}{url}{link:#}");
             }
-            if should_launch_browser(print_only, json, std::io::stdout().is_terminal()) {
+            if should_launch_browser(
+                print_only,
+                json,
+                agent_enabled(),
+                std::io::stdout().is_terminal(),
+            ) {
                 launch_browser(&url);
             }
         }
@@ -2524,8 +2527,8 @@ fn open_json(id: &str, summary: &str, url: &str) -> Value {
     json!({"idReadable": id, "summary": summary, "url": url})
 }
 
-fn should_launch_browser(print_only: bool, json: bool, stdout_tty: bool) -> bool {
-    !print_only && !json && stdout_tty
+fn should_launch_browser(print_only: bool, json: bool, agent: bool, stdout_tty: bool) -> bool {
+    !print_only && !json && !agent && stdout_tty
 }
 
 fn browser_command(url: &str) -> (&'static str, Vec<String>) {
@@ -3741,10 +3744,11 @@ mod tests {
 
     #[test]
     fn browser_launch_only_on_an_interactive_text_run() {
-        assert!(should_launch_browser(false, false, true));
-        assert!(!should_launch_browser(true, false, true));
-        assert!(!should_launch_browser(false, true, true));
-        assert!(!should_launch_browser(false, false, false));
+        assert!(should_launch_browser(false, false, false, true));
+        assert!(!should_launch_browser(true, false, false, true));
+        assert!(!should_launch_browser(false, true, false, true));
+        assert!(!should_launch_browser(false, false, true, true));
+        assert!(!should_launch_browser(false, false, false, false));
     }
 
     #[test]
