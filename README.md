@@ -95,6 +95,8 @@ yt read api PATH [--fields F] [--query K=V]... [--top N] [--skip N]   raw authen
 yt write issue new PROJECT "SUMMARY" [-d DESC|-d -] [-f "Priority Critical"]...  prints new ID only
 yt write issue edit ID [-s "SUMMARY"] [-d DESC|-d -]   edit summary/description; prints ID
 yt write issue comment ID [TEXT] [--public|--group G...|--user U...]   add comment (stdin if TEXT omitted); default visibility unless restricted
+yt write issue comment-edit ID COMMENT_ID [TEXT]   replace a comment's text (stdin if TEXT omitted)
+yt write issue comment-delete ID COMMENT_ID [--permanent]   delete a comment (trash; --permanent erases it)
 yt write issue comment-visibility ID COMMENT_ID (--public|--group G...|--user U...)   change a comment's visibility; prints the result
 yt write issue link ID "PHRASE" TARGET      link two issues, e.g. yt write issue link YT-1 "relates to" YT-2
 yt write issue unlink ID "PHRASE" TARGET    remove a link (same phrase)
@@ -145,6 +147,17 @@ work either way. Piping already strips colour (`NO_COLOR` is honoured too);
 `muteUpdateNotifications=true` on `yt write issue …` calls so watchers are not
 emailed. The server honors it only when the token's user has the *Apply
 Commands Silently* permission.
+
+### Editing and deleting comments
+
+`yt write issue comment-edit ID COMMENT_ID [TEXT]` replaces a comment's text,
+reading stdin when `TEXT` is omitted. `yt write issue comment-delete ID
+COMMENT_ID` moves a comment to the trash, which is what the web UI's delete
+does and what an ordinary token is allowed to do; trashed comments disappear
+from `yt read issue comments` and carry `"deleted": true` under `--json`.
+`--permanent` additionally erases the comment, which needs a token with the
+*Delete Comment permanently* permission — without it the comment is still
+trashed and the command exits non-zero.
 
 ### Comment visibility
 
@@ -222,6 +235,7 @@ under `yt read …` (safe) or `yt write …` (mutating):
 - `yt write issue new DEMO "summary" -d - [-f "Priority Critical"]` — create, desc from stdin, prints ID
 - `yt write issue edit DEMO-1 -s "new summary" -d -` — edit summary/description (desc from stdin)
 - `yt write issue comment DEMO-1 "text" [--group Devs] [--user alice]` — comment (restricted visibility optional)
+- `yt write issue comment-edit DEMO-1 4-123 "fixed text"` / `yt write issue comment-delete DEMO-1 4-123` — edit or remove a comment
 - `yt write issue comment-visibility DEMO-1 4-123 --public` — change a comment's visibility
 - `yt read issue links DEMO-1`, `yt write issue link DEMO-1 "relates to" DEMO-2`, `yt write issue unlink DEMO-1 "depends on" DEMO-3` — relations
 - `yt read issue attachments DEMO-1 [-o DIR]` — list attachments; `-o` downloads them (default cwd)
