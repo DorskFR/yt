@@ -8,13 +8,13 @@ use std::io::{IsTerminal, Read};
 const LIST_FIELDS: &str = "idReadable,summary,tags(name),customFields(name,value(name,login,text))";
 const ISSUE_FIELDS: &str = "idReadable,summary,description,created,updated,reporter(login),tags(name),customFields(name,value(name,login,text))";
 const COMMENT_FIELDS: &str =
-    "id,author(login),created,text,visibility($type,permittedGroups(name),permittedUsers(login))";
+    "id,author(login),created,text,deleted,visibility($type,permittedGroups(name),permittedUsers(login))";
 const LINK_FIELDS: &str =
     "id,direction,linkType(name,sourceToTarget,targetToSource),issues(idReadable,summary)";
 // --json field sets must carry entity `id`s so results can feed `yt write`.
 const LIST_FIELDS_JSON: &str = "id,idReadable,summary,created,updated,reporter(id,login),tags(id,name),customFields(id,name,value(id,name,login,text))";
 const ISSUE_FIELDS_JSON: &str = "id,idReadable,summary,description,created,updated,reporter(id,login),tags(id,name),customFields(id,name,value(id,name,login,text))";
-const COMMENT_FIELDS_JSON: &str = "id,author(id,login),created,updated,text,visibility($type,permittedGroups(id,name),permittedUsers(id,login))";
+const COMMENT_FIELDS_JSON: &str = "id,author(id,login),created,updated,text,deleted,visibility($type,permittedGroups(id,name),permittedUsers(id,login))";
 const LINK_FIELDS_JSON: &str =
     "id,direction,linkType(id,name,sourceToTarget,targetToSource),issues(id,idReadable,summary)";
 // Pull requests surface in the activity stream under PullRequestChangeCategory
@@ -211,7 +211,7 @@ enum ReadServerCmd {
 
 #[derive(Subcommand)]
 enum WriteCmd {
-    /// Mutate issues (new, edit, attach, comment, comment-visibility, link, unlink, cmd, tag, untag)
+    /// Mutate issues (new, edit, attach, comment, comment-edit, comment-delete, comment-visibility, link, unlink, cmd, tag, untag)
     Issue {
         #[command(subcommand)]
         cmd: WriteIssueCmd,
@@ -286,6 +286,25 @@ enum WriteIssueCmd {
         /// Restrict visibility to a user by login (repeatable, combinable with --group)
         #[arg(long)]
         user: Vec<String>,
+    },
+    /// Replace an existing comment's text (text arg, or stdin if omitted)
+    CommentEdit {
+        /// Issue id, e.g. DEMO-1
+        issue: String,
+        /// Comment id as printed in parentheses by `yt read issue comments` (e.g. 4-123)
+        comment_id: String,
+        /// New comment text (reads stdin when omitted)
+        text: Option<String>,
+    },
+    /// Delete an existing comment (moves it to the trash; --permanent erases it)
+    CommentDelete {
+        /// Issue id, e.g. DEMO-1
+        issue: String,
+        /// Comment id as printed in parentheses by `yt read issue comments` (e.g. 4-123)
+        comment_id: String,
+        /// Erase the comment instead of trashing it; needs the "delete permanently" permission
+        #[arg(long)]
+        permanent: bool,
     },
     /// Change an existing comment's visibility; prints the resulting visibility
     #[command(group(clap::ArgGroup::new("vis").required(true).multiple(true)))]
@@ -1397,7 +1416,13 @@ fn print_comments(c: &Client, id: &str) -> Result<()> {
         &format!("issues/{id}/comments"),
         &[("fields", COMMENT_FIELDS)],
     )?;
-    let list = comments.as_array().cloned().unwrap_or_default();
+    let list: Vec<Value> = comments
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|cm| cm["deleted"].as_bool() != Some(true))
+        .collect();
     if list.is_empty() {
         println!("no comments");
     }
@@ -2058,6 +2083,53 @@ fn run() -> Result<()> {
             }
             c.post(&format!("issues/{id}/comments"), &[], body)?;
             println!("ok");
+        }
+        Cmd::Write {
+            cmd:
+                WriteCmd::Issue {
+                    cmd:
+                        WriteIssueCmd::CommentEdit {
+                            issue,
+                            comment_id,
+                            text,
+                        },
+                },
+        } => {
+            let text = match text {
+                Some(t) => t,
+                None => stdin_text()?,
+            };
+            if text.is_empty() {
+                bail!("empty comment");
+            }
+            c.post(
+                &format!("issues/{issue}/comments/{comment_id}"),
+                &[("fields", "id")],
+                json!({ "text": text }),
+            )?;
+            println!("{comment_id} updated");
+        }
+        Cmd::Write {
+            cmd:
+                WriteCmd::Issue {
+                    cmd:
+                        WriteIssueCmd::CommentDelete {
+                            issue,
+                            comment_id,
+                            permanent,
+                        },
+                },
+        } => {
+            let path = format!("issues/{issue}/comments/{comment_id}");
+            c.post(&path, &[("fields", "id")], json!({ "deleted": true }))?;
+            if permanent {
+                c.delete(&path).context(
+                    "comment was trashed but not erased: the token lacks permission to delete comments permanently",
+                )?;
+                println!("{comment_id} erased");
+            } else {
+                println!("{comment_id} deleted");
+            }
         }
         Cmd::Write {
             cmd:
@@ -2767,6 +2839,42 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn comment_edit_takes_optional_text_and_delete_takes_none() {
+        assert!(
+            Cli::try_parse_from(["yt", "write", "issue", "comment-edit", "X-1", "4-2"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["yt", "write", "issue", "comment-edit", "X-1", "4-2", "new"])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["yt", "write", "issue", "comment-edit", "X-1"]).is_err());
+        assert!(
+            Cli::try_parse_from(["yt", "write", "issue", "comment-delete", "X-1", "4-2"]).is_ok()
+        );
+        assert!(Cli::try_parse_from([
+            "yt",
+            "write",
+            "issue",
+            "comment-delete",
+            "X-1",
+            "4-2",
+            "--permanent"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["yt", "write", "issue", "comment-delete", "X-1"]).is_err());
+        assert!(Cli::try_parse_from([
+            "yt",
+            "write",
+            "issue",
+            "comment-delete",
+            "X-1",
+            "4-2",
+            "extra"
+        ])
+        .is_err());
+    }
+
     // ---- json output mode ----
 
     fn read_json_flag(args: &[&str]) -> bool {
@@ -2882,6 +2990,9 @@ mod tests {
         assert!(LIST_FIELDS_JSON.contains("idReadable"));
         assert!(ISSUE_FIELDS_JSON.contains("idReadable"));
         assert!(COMMENT_FIELDS_JSON.contains("visibility($type"));
+        for f in [COMMENT_FIELDS, COMMENT_FIELDS_JSON] {
+            assert!(f.contains("deleted"), "{f} must request deleted");
+        }
     }
 
     // ---- URL normalization ----
