@@ -76,6 +76,8 @@ yt read issue ls "QUERY" [-n 20] [--full] [--merged-pr]   search; one line per i
                                             (a `# limit N reached` hint goes to stderr when -n is hit;
                                             --merged-pr keeps only issues with a merged PR, one extra call per row)
 yt read issue show ID [-c] [--pr]           issue detail (fields, tags, links); -c appends comments, --pr linked PRs
+yt read issue open ID [-p]                  print ID  SUMMARY + web URL, then open it in the browser
+                                            (-p/--print-only, --json, or a non-TTY stdout skip the launch)
 yt read issue comments ID                   list comments
 yt read issue links ID                      list links (PHRASE  ID  SUMMARY), grouped by relation
 yt read issue attachments ID [-o DIR]       list attachments (NAME SIZE); -o downloads to DIR (default .)
@@ -202,6 +204,7 @@ Use the `yt` CLI for issue tracking (auth already configured). Commands live
 under `yt read …` (safe) or `yt write …` (mutating):
 - `yt read issue ls "project: DEMO #Unresolved sort by: updated desc" [-n N] [--full]` — search
 - `yt read issue show DEMO-1 [-c] [--pr]` — detail (+comments/PRs); `yt read issue comments DEMO-1`
+- `yt read issue open DEMO-1 [-p]` — print the web URL and open it in a browser (`-p` prints only)
 - `yt write issue new DEMO "summary" -d - [-f "Priority Critical"]` — create, desc from stdin, prints ID
 - `yt write issue edit DEMO-1 -s "new summary" -d -` — edit summary/description (desc from stdin)
 - `yt write issue comment DEMO-1 "text" [--group Devs] [--user alice]` — comment (restricted visibility optional)

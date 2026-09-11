@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use serde_json::{json, Value};
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 
 const LIST_FIELDS: &str = "idReadable,summary,tags(name),customFields(name,value(name,login,text))";
 const ISSUE_FIELDS: &str = "idReadable,summary,description,created,updated,reporter(login),tags(name),customFields(name,value(name,login,text))";
@@ -139,6 +139,14 @@ enum ReadIssueCmd {
         /// Include linked pull requests (state, title, url)
         #[arg(long)]
         pr: bool,
+    },
+    /// Print an issue's web URL and open it in the default browser
+    Open {
+        /// Issue id, e.g. DEMO-1
+        id: String,
+        /// Print the URL without launching a browser
+        #[arg(short = 'p', long)]
+        print_only: bool,
     },
     /// List an issue's attachments; -o DIR downloads them
     Attachments {
@@ -1390,7 +1398,6 @@ fn maybe_print_update_notice() {
         return;
     }
     // Only nag interactive users; never pollute piped/agent output.
-    use std::io::IsTerminal;
     if !std::io::stderr().is_terminal() {
         return;
     }
@@ -2292,6 +2299,31 @@ fn run() -> Result<()> {
             let v = c.get(path.trim_start_matches('/'), &refs)?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
+        Cmd::Read {
+            json,
+            cmd:
+                ReadCmd::Issue {
+                    cmd: ReadIssueCmd::Open { id, print_only },
+                },
+        } => {
+            let i = c.get(&format!("issues/{id}"), &[("fields", "idReadable,summary")])?;
+            let rid = i["idReadable"].as_str().unwrap_or(&id);
+            let summary = i["summary"].as_str().unwrap_or("");
+            let url = c.web_url(rid);
+            if json {
+                print_json(&open_json(rid, summary, &url))?;
+            } else {
+                let ids = id_style();
+                let link = Style::new()
+                    .underline()
+                    .fg_color(Some(AnsiColor::Blue.into()));
+                anstream::println!("{ids}{rid}{ids:#}  {summary}");
+                anstream::println!("{link}{url}{link:#}");
+            }
+            if should_launch_browser(print_only, json, std::io::stdout().is_terminal()) {
+                launch_browser(&url);
+            }
+        }
         // Local-only commands handled in `run_local` before the client resolves.
         Cmd::Completions { .. }
         | Cmd::Read {
@@ -2311,6 +2343,40 @@ fn run() -> Result<()> {
     }
     maybe_print_update_notice();
     Ok(())
+}
+
+fn open_json(id: &str, summary: &str, url: &str) -> Value {
+    json!({"idReadable": id, "summary": summary, "url": url})
+}
+
+fn should_launch_browser(print_only: bool, json: bool, stdout_tty: bool) -> bool {
+    !print_only && !json && stdout_tty
+}
+
+fn browser_command(url: &str) -> (&'static str, Vec<String>) {
+    if cfg!(target_os = "macos") {
+        ("open", vec![url.to_string()])
+    } else if cfg!(target_os = "windows") {
+        (
+            "cmd",
+            vec!["/C".into(), "start".into(), String::new(), url.to_string()],
+        )
+    } else {
+        ("xdg-open", vec![url.to_string()])
+    }
+}
+
+fn launch_browser(url: &str) {
+    let (prog, args) = browser_command(url);
+    let spawned = std::process::Command::new(prog)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Err(e) = spawned {
+        eprintln!("# could not launch {prog} ({e}); open the URL above yourself");
+    }
 }
 
 fn main() {
@@ -3327,6 +3393,60 @@ mod tests {
             .flat_map(|t| stale_yt_references(t, &paths))
             .collect();
         assert!(stale.is_empty(), "stale command references: {stale:?}");
+    }
+
+    // ---- issue open ----
+
+    #[test]
+    fn open_reuses_the_show_web_url() {
+        assert_eq!(
+            test_client(false).web_url("DEMO-1"),
+            "https://yt.example.com/issue/DEMO-1"
+        );
+    }
+
+    #[test]
+    fn open_json_carries_id_summary_url() {
+        assert_eq!(
+            open_json("DEMO-1", "a summary", "https://yt.example.com/issue/DEMO-1"),
+            json!({
+                "idReadable": "DEMO-1",
+                "summary": "a summary",
+                "url": "https://yt.example.com/issue/DEMO-1"
+            })
+        );
+    }
+
+    #[test]
+    fn browser_launch_only_on_an_interactive_text_run() {
+        assert!(should_launch_browser(false, false, true));
+        assert!(!should_launch_browser(true, false, true));
+        assert!(!should_launch_browser(false, true, true));
+        assert!(!should_launch_browser(false, false, false));
+    }
+
+    #[test]
+    fn browser_command_targets_the_platform_opener() {
+        let (prog, args) = browser_command("https://yt.example.com/issue/DEMO-1");
+        let expected = if cfg!(target_os = "macos") {
+            "open"
+        } else if cfg!(target_os = "windows") {
+            "cmd"
+        } else {
+            "xdg-open"
+        };
+        assert_eq!(prog, expected);
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("https://yt.example.com/issue/DEMO-1")
+        );
+    }
+
+    #[test]
+    fn open_parses_with_and_without_print_only() {
+        assert!(Cli::try_parse_from(["yt", "read", "issue", "open", "DEMO-1"]).is_ok());
+        assert!(Cli::try_parse_from(["yt", "read", "issue", "open", "DEMO-1", "-p"]).is_ok());
+        assert!(Cli::try_parse_from(["yt", "read", "issue", "open"]).is_err());
     }
 
     #[test]
