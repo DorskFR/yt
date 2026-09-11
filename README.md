@@ -76,6 +76,8 @@ yt read issue ls "QUERY" [-n 20] [--full] [--merged-pr]   search; one line per i
                                             (a `# limit N reached` hint goes to stderr when -n is hit;
                                             --merged-pr keeps only issues with a merged PR, one extra call per row)
 yt read issue show ID [-c] [--pr]           issue detail (fields, tags, links); -c appends comments, --pr linked PRs
+yt read issue open ID [-p]                  print ID  SUMMARY + web URL, then open it in the browser
+                                            (-p/--print-only, --json, or a non-TTY stdout skip the launch)
 yt read issue comments ID                   list comments
 yt read issue links ID                      list links (PHRASE  ID  SUMMARY), grouped by relation
 yt read issue attachments ID [-o DIR]       list attachments (NAME SIZE); -o downloads to DIR (default .)
@@ -108,6 +110,7 @@ yt write update [--force]                   self-update to the latest release
 yt completions SHELL                        print a completion script (bash|zsh|fish|powershell|elvish)
 --server NAME                               (global) use a named server for any command
 --silent                                    (global) mute watcher notifications on writes (or YT_MUTE_NOTIFICATIONS=1)
+--agent                                     (global) plain, stable output: no colour, no update notice (or YT_AGENT=1)
 --json                                      (read tier) raw JSON instead of text, with entity ids
 ```
 
@@ -122,6 +125,19 @@ With `--json`, `issue show` emits the issue object plus a `links` array, and add
 `comments` (with `-c`) and `pullRequests` (`[{"state","url"}]`, with `--pr`).
 `server ls` emits `[{"name","url","default"}]` (never the token) and `query-help`
 emits `{"text": ...}`.
+
+### Agent mode
+
+On a terminal the text output is colourised: bold cyan issue ids, green/yellow
+states (dim once resolved), red priorities, a magenta assignee, blue tags, and
+dimmed metadata keys in `issue show`. `issue ls` pads the id/state/priority/
+assignee columns so summaries line up.
+
+`--agent` (or `YT_AGENT=1`; the flag wins) turns all of that off: colour is
+forced off regardless of TTY and the `update available:` notice is suppressed,
+as with `YT_NO_UPDATE_CHECK=1`. Line formats are unchanged, so the same greps
+work either way. Piping already strips colour (`NO_COLOR` is honoured too);
+`--agent` is the switch a harness can set once for a whole session.
 
 ### Silent writes
 
@@ -202,6 +218,7 @@ Use the `yt` CLI for issue tracking (auth already configured). Commands live
 under `yt read …` (safe) or `yt write …` (mutating):
 - `yt read issue ls "project: DEMO #Unresolved sort by: updated desc" [-n N] [--full]` — search
 - `yt read issue show DEMO-1 [-c] [--pr]` — detail (+comments/PRs); `yt read issue comments DEMO-1`
+- `yt read issue open DEMO-1 [-p]` — print the web URL and open it in a browser (`-p` prints only)
 - `yt write issue new DEMO "summary" -d - [-f "Priority Critical"]` — create, desc from stdin, prints ID
 - `yt write issue edit DEMO-1 -s "new summary" -d -` — edit summary/description (desc from stdin)
 - `yt write issue comment DEMO-1 "text" [--group Devs] [--user alice]` — comment (restricted visibility optional)
