@@ -108,6 +108,7 @@ yt write update [--force]                   self-update to the latest release
 yt completions SHELL                        print a completion script (bash|zsh|fish|powershell|elvish)
 --server NAME                               (global) use a named server for any command
 --silent                                    (global) mute watcher notifications on writes (or YT_MUTE_NOTIFICATIONS=1)
+--agent                                     (global) plain, stable output: no colour, no update notice (or YT_AGENT=1)
 --json                                      (read tier) raw JSON instead of text, with entity ids
 ```
 
@@ -122,6 +123,19 @@ With `--json`, `issue show` emits the issue object plus a `links` array, and add
 `comments` (with `-c`) and `pullRequests` (`[{"state","url"}]`, with `--pr`).
 `server ls` emits `[{"name","url","default"}]` (never the token) and `query-help`
 emits `{"text": ...}`.
+
+### Agent mode
+
+On a terminal the text output is colourised: bold cyan issue ids, green/yellow
+states (dim once resolved), red priorities, a magenta assignee, blue tags, and
+dimmed metadata keys in `issue show`. `issue ls` pads the id/state/priority/
+assignee columns so summaries line up.
+
+`--agent` (or `YT_AGENT=1`; the flag wins) turns all of that off: colour is
+forced off regardless of TTY and the `update available:` notice is suppressed,
+as with `YT_NO_UPDATE_CHECK=1`. Line formats are unchanged, so the same greps
+work either way. Piping already strips colour (`NO_COLOR` is honoured too);
+`--agent` is the switch a harness can set once for a whole session.
 
 ### Silent writes
 
