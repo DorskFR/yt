@@ -931,13 +931,14 @@ dependencies = [
 
 [[package]]
 name = "yt"
-version = "0.14.4"
+version = "0.14.5"
 dependencies = [
  "anstream 0.6.21",
  "anstyle",
  "anyhow",
  "clap",
  "clap_complete",
+ "libc",
  "serde_json",
  "sha2",
  "ureq",

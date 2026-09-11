@@ -2557,7 +2557,19 @@ fn launch_browser(url: &str) {
     }
 }
 
+/// Rust ignores SIGPIPE at startup, which turns a closed pipe into an EPIPE panic.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 fn main() {
+    reset_sigpipe();
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
