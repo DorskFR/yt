@@ -39,6 +39,10 @@ struct Cli {
     /// Commands Silently* permission.
     #[arg(long, global = true)]
     silent: bool,
+    /// Machine-readable output: force colour off regardless of TTY and suppress
+    /// the update-available notice (also via YT_AGENT=1; the flag wins)
+    #[arg(long, global = true)]
+    agent: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -471,6 +475,25 @@ fn mute_notifications(flag: bool, env: Option<&str>) -> bool {
     flag || matches!(env, Some("1") | Some("true"))
 }
 
+/// Whether output must stay machine-stable. The `--agent` flag wins; otherwise
+/// YT_AGENT enables it when set to "1" or "true". Pure.
+fn agent_mode(flag: bool, env: Option<&str>) -> bool {
+    flag || matches!(env, Some("1") | Some("true"))
+}
+
+static AGENT_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn agent_enabled() -> bool {
+    AGENT_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_agent_mode(on: bool) {
+    AGENT_MODE.store(on, std::sync::atomic::Ordering::Relaxed);
+    if on {
+        anstream::ColorChoice::Never.write_global();
+    }
+}
+
 impl Client {
     fn resolve(server: Option<&str>, silent: bool) -> Result<Self> {
         let env_url = std::env::var("YOUTRACK_URL").ok();
@@ -709,15 +732,6 @@ fn tag_names(i: &Value) -> Vec<&str> {
         .collect()
 }
 
-fn tags_meta(i: &Value) -> Option<String> {
-    let names = tag_names(i);
-    (!names.is_empty()).then(|| format!("tags:{}", names.join(",")))
-}
-
-fn tags_suffix(i: &Value) -> String {
-    tag_names(i).iter().map(|n| format!(" #{n}")).collect()
-}
-
 fn cf_get(issue: &Value, name: &str) -> Option<String> {
     issue["customFields"]
         .as_array()?
@@ -739,27 +753,32 @@ fn id_style() -> Style {
     Style::new().bold().fg_color(Some(AnsiColor::Cyan.into()))
 }
 
-/// State: green when resolved-ish, yellow when active, plain otherwise.
-fn state_style(s: &str) -> Style {
-    let l = s.to_ascii_lowercase();
-    let color = if [
+fn is_resolved(state: &str) -> bool {
+    let l = state.to_ascii_lowercase();
+    [
         "done", "fixed", "resolved", "verified", "closed", "complete",
     ]
     .iter()
     .any(|k| l.contains(k))
+}
+
+/// State: dim green once resolved, yellow while open, bold yellow in progress.
+fn state_style(s: &str) -> Style {
+    let l = s.to_ascii_lowercase();
+    if is_resolved(s) {
+        Style::new()
+            .dimmed()
+            .fg_color(Some(AnsiColor::Green.into()))
+    } else if l.contains("progress") || l.contains("review") {
+        Style::new().bold().fg_color(Some(AnsiColor::Yellow.into()))
+    } else if ["open", "new", "backlog", "reopen", "to do", "wait"]
+        .iter()
+        .any(|k| l.contains(k))
     {
-        AnsiColor::Green
-    } else if [
-        "open", "new", "progress", "backlog", "reopen", "to do", "wait",
-    ]
-    .iter()
-    .any(|k| l.contains(k))
-    {
-        AnsiColor::Yellow
+        Style::new().fg_color(Some(AnsiColor::Yellow.into()))
     } else {
-        return Style::new();
-    };
-    Style::new().fg_color(Some(color.into()))
+        Style::new()
+    }
 }
 
 /// Priority: red (bold for critical), dim for minor, plain otherwise.
@@ -774,6 +793,181 @@ fn prio_style(s: &str) -> Style {
     } else {
         Style::new()
     }
+}
+
+const UNASSIGNED: &str = "-";
+
+/// Style set for the human-readable output. `plain()` is what `--agent` and the
+/// render tests use; `rich()` drives an interactive terminal.
+struct Theme {
+    rich: bool,
+    id: Style,
+    key: Style,
+    heading: Style,
+    assignee: Style,
+    tag: Style,
+    url: Style,
+    muted: Style,
+}
+
+impl Theme {
+    fn plain() -> Self {
+        Self {
+            rich: false,
+            id: Style::new(),
+            key: Style::new(),
+            heading: Style::new(),
+            assignee: Style::new(),
+            tag: Style::new(),
+            url: Style::new(),
+            muted: Style::new(),
+        }
+    }
+
+    fn rich() -> Self {
+        Self {
+            rich: true,
+            id: id_style(),
+            key: Style::new().dimmed(),
+            heading: Style::new().bold(),
+            assignee: Style::new().fg_color(Some(AnsiColor::Magenta.into())),
+            tag: Style::new().fg_color(Some(AnsiColor::Blue.into())),
+            url: Style::new()
+                .underline()
+                .fg_color(Some(AnsiColor::Blue.into())),
+            muted: Style::new().dimmed(),
+        }
+    }
+
+    fn detect() -> Self {
+        if agent_enabled() {
+            Self::plain()
+        } else {
+            Self::rich()
+        }
+    }
+
+    fn state(&self, s: &str) -> Style {
+        if self.rich {
+            state_style(s)
+        } else {
+            Style::new()
+        }
+    }
+
+    fn prio(&self, s: &str) -> Style {
+        if self.rich {
+            prio_style(s)
+        } else {
+            Style::new()
+        }
+    }
+
+    fn who(&self, s: &str) -> Style {
+        if s == UNASSIGNED {
+            self.muted
+        } else {
+            self.assignee
+        }
+    }
+
+    fn meta_value(&self, key: &str, value: &str) -> Style {
+        match key.to_ascii_lowercase().as_str() {
+            "state" => self.state(value),
+            "priority" => self.prio(value),
+            "assignee" => self.who(if value == UNASSIGNED {
+                UNASSIGNED
+            } else {
+                value
+            }),
+            "tags" => self.tag,
+            _ => Style::new(),
+        }
+    }
+}
+
+fn pad(s: &str, width: usize) -> String {
+    " ".repeat(width.saturating_sub(s.chars().count()))
+}
+
+fn ls_cells(i: &Value) -> [String; 4] {
+    [
+        i["idReadable"].as_str().unwrap_or("?").to_string(),
+        cf_get(i, "State").unwrap_or_else(|| UNASSIGNED.into()),
+        cf_get(i, "Priority").unwrap_or_else(|| UNASSIGNED.into()),
+        cf_get(i, "Assignee").map_or_else(|| UNASSIGNED.into(), |a| format!("@{a}")),
+    ]
+}
+
+fn ls_widths(rows: &[[String; 4]]) -> [usize; 4] {
+    let mut w = [0usize; 4];
+    for cells in rows {
+        for (slot, c) in w.iter_mut().zip(cells) {
+            *slot = (*slot).max(c.chars().count());
+        }
+    }
+    w
+}
+
+/// One `ls` row: `ID  STATE  PRIO  @ASSIGNEE  summary #tags`, columns padded to
+/// `w` so the summary starts at the same offset on every line.
+fn ls_line(i: &Value, cells: &[String; 4], w: &[usize; 4], t: &Theme) -> String {
+    let [id, state, prio, who] = cells;
+    let (ids, ss, ps, ws) = (t.id, t.state(state), t.prio(prio), t.who(who));
+    let mut line = format!(
+        "{ids}{id}{ids:#}{}  {ss}{state}{ss:#}{}  {ps}{prio}{ps:#}{}  {ws}{who}{ws:#}{}  {}",
+        pad(id, w[0]),
+        pad(state, w[1]),
+        pad(prio, w[2]),
+        pad(who, w[3]),
+        i["summary"].as_str().unwrap_or("")
+    );
+    let tg = t.tag;
+    for n in tag_names(i) {
+        line.push_str(&format!(" {tg}#{n}{tg:#}"));
+    }
+    line.trim_end().to_string()
+}
+
+/// `show` meta as key/value pairs. Assignee is always emitted when the project
+/// carries the field, so "nobody assigned" reads differently from "no such field".
+fn meta_pairs(i: &Value) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = i["customFields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| {
+            let name = f["name"].as_str()?;
+            match cf_value(&f["value"]) {
+                Some(v) => Some((name.to_string(), v)),
+                None if name.eq_ignore_ascii_case("assignee") => {
+                    Some((name.to_string(), UNASSIGNED.into()))
+                }
+                None => None,
+            }
+        })
+        .collect();
+    pairs.push(("created".into(), date(&i["created"])));
+    pairs.push(("updated".into(), date(&i["updated"])));
+    if let Some(r) = i["reporter"]["login"].as_str() {
+        pairs.push(("by".into(), r.into()));
+    }
+    let tags = tag_names(i);
+    if !tags.is_empty() {
+        pairs.push(("tags".into(), tags.join(",")));
+    }
+    pairs
+}
+
+fn meta_line(pairs: &[(String, String)], t: &Theme) -> String {
+    pairs
+        .iter()
+        .map(|(k, v)| {
+            let (ks, vs) = (t.key, t.meta_value(k, v));
+            format!("{ks}{k}:{ks:#}{vs}{v}{vs:#}")
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 fn print_json(v: &Value) -> Result<()> {
@@ -1199,9 +1393,11 @@ fn print_comments(c: &Client, id: &str) -> Result<()> {
     if list.is_empty() {
         println!("no comments");
     }
+    let t = Theme::detect();
+    let (ks, ws) = (t.key, t.assignee);
     for cm in &list {
-        println!(
-            "[{} {}] ({}){} {}",
+        anstream::println!(
+            "{ks}[{} {ks:#}{ws}{}{ws:#}{ks}] ({}){}{ks:#} {}",
             date(&cm["created"]),
             cm["author"]["login"].as_str().unwrap_or("?"),
             cm["id"].as_str().unwrap_or("?"),
@@ -1235,13 +1431,13 @@ fn fetch_links(c: &Client, id: &str, fields: &str) -> Result<Vec<Value>> {
 }
 
 /// Print link groups, one linked issue per line: `phrase  ID  summary`.
-fn print_link_groups(groups: &[Value]) {
-    let ids = id_style();
+fn print_link_groups(groups: &[Value], t: &Theme) {
+    let (ids, ks) = (t.id, t.key);
     for g in groups {
         let phrase = link_phrase(g);
         for li in g["issues"].as_array().into_iter().flatten() {
             anstream::println!(
-                "{phrase}  {ids}{}{ids:#}  {}",
+                "{ks}{phrase}{ks:#}  {ids}{}{ids:#}  {}",
                 li["idReadable"].as_str().unwrap_or("?"),
                 li["summary"].as_str().unwrap_or("")
             );
@@ -1256,7 +1452,7 @@ fn print_links(c: &Client, id: &str) -> Result<()> {
         println!("no links");
         return Ok(());
     }
-    print_link_groups(&groups);
+    print_link_groups(&groups, &Theme::detect());
     Ok(())
 }
 
@@ -1386,7 +1582,7 @@ fn fetch_latest_release() -> Result<(String, String)> {
 /// Uses a cached check (refreshed at most once per interval) so most runs do no
 /// network IO. Silent on any failure, when opted out, or when not a TTY.
 fn maybe_print_update_notice() {
-    if std::env::var_os("YT_NO_UPDATE_CHECK").is_some() {
+    if agent_enabled() || std::env::var_os("YT_NO_UPDATE_CHECK").is_some() {
         return;
     }
     // Only nag interactive users; never pollute piped/agent output.
@@ -1598,6 +1794,10 @@ fn run_local(cmd: &Cmd) -> Result<bool> {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    set_agent_mode(agent_mode(
+        cli.agent,
+        std::env::var("YT_AGENT").ok().as_deref(),
+    ));
     if run_local(&cli.cmd)? {
         return Ok(());
     }
@@ -1663,18 +1863,11 @@ fn run() -> Result<()> {
                 println!("no matches");
                 return Ok(());
             }
-            for i in &list {
-                let id = i["idReadable"].as_str().unwrap_or("?");
-                let state = cf_get(i, "State");
-                let state = state.as_deref().unwrap_or("-");
-                let prio = cf_get(i, "Priority");
-                let prio = prio.as_deref().unwrap_or("-");
-                let (ids, ss, ps) = (id_style(), state_style(state), prio_style(prio));
-                anstream::println!(
-                    "{ids}{id}{ids:#}  {ss}{state}{ss:#}  {ps}{prio}{ps:#}  {}{}",
-                    i["summary"].as_str().unwrap_or(""),
-                    tags_suffix(i)
-                );
+            let theme = Theme::detect();
+            let cells: Vec<[String; 4]> = list.iter().map(ls_cells).collect();
+            let widths = ls_widths(&cells);
+            for (i, c) in list.iter().zip(&cells) {
+                anstream::println!("{}", ls_line(i, c, &widths, &theme));
                 if full {
                     if let Some(d) = i["description"].as_str().filter(|d| !d.is_empty()) {
                         for line in d.trim_end().lines() {
@@ -1720,36 +1913,15 @@ fn run() -> Result<()> {
                 print_json(&show_json(i, links, cm, prs.as_deref()))?;
                 return Ok(());
             }
-            let ids = id_style();
+            let t = Theme::detect();
+            let (ids, hd) = (t.id, t.heading);
             anstream::println!(
                 "{ids}{}{ids:#}  {}",
                 i["idReadable"].as_str().unwrap_or(&id),
                 i["summary"].as_str().unwrap_or("")
             );
-            let mut meta: Vec<String> = i["customFields"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|f| {
-                    Some(format!(
-                        "{}:{}",
-                        f["name"].as_str()?,
-                        cf_value(&f["value"])?
-                    ))
-                })
-                .collect();
-            meta.push(format!("created:{}", date(&i["created"])));
-            meta.push(format!("updated:{}", date(&i["updated"])));
-            if let Some(r) = i["reporter"]["login"].as_str() {
-                meta.push(format!("by:{r}"));
-            }
-            if let Some(t) = tags_meta(&i) {
-                meta.push(t);
-            }
-            println!("{}", meta.join("  "));
-            let link = Style::new()
-                .underline()
-                .fg_color(Some(AnsiColor::Blue.into()));
+            anstream::println!("{}", meta_line(&meta_pairs(&i), &t));
+            let link = t.url;
             anstream::println!(
                 "{link}{}{link:#}",
                 c.web_url(i["idReadable"].as_str().unwrap_or(&id))
@@ -1759,22 +1931,25 @@ fn run() -> Result<()> {
             }
             let links = fetch_links(&c, i["idReadable"].as_str().unwrap_or(&id), LINK_FIELDS)?;
             if !links.is_empty() {
-                println!("\n-- links --");
-                print_link_groups(&links);
+                anstream::println!("\n{hd}-- links --{hd:#}");
+                print_link_groups(&links, &t);
             }
             if pr {
                 let prs = fetch_pr_changes(&c, i["idReadable"].as_str().unwrap_or(&id))?;
-                println!("\n-- pull requests --");
+                anstream::println!("\n{hd}-- pull requests --{hd:#}");
                 if prs.is_empty() {
                     println!("no pull requests");
                 }
                 for (state, url) in &prs {
-                    let ss = state_style(state);
-                    anstream::println!("{ss}{state}{ss:#}  {}", url.as_deref().unwrap_or(""));
+                    let (ss, us) = (t.state(state), t.url);
+                    anstream::println!(
+                        "{ss}{state}{ss:#}  {us}{}{us:#}",
+                        url.as_deref().unwrap_or("")
+                    );
                 }
             }
             if comments {
-                println!("\n-- comments --");
+                anstream::println!("\n{hd}-- comments --{hd:#}");
                 print_comments(&c, i["idReadable"].as_str().unwrap_or(&id))?;
             }
         }
@@ -2330,8 +2505,7 @@ mod tests {
     #[test]
     fn tags_render_when_present() {
         let i = json!({"tags": [{"name": "Blocked"}, {"name": "needs review"}]});
-        assert_eq!(tags_meta(&i).as_deref(), Some("tags:Blocked,needs review"));
-        assert_eq!(tags_suffix(&i), " #Blocked #needs review");
+        assert_eq!(tag_names(&i), ["Blocked", "needs review"]);
     }
 
     #[test]
@@ -2341,8 +2515,7 @@ mod tests {
             json!({"tags": []}),
             json!({"tags": [{"name": ""}]}),
         ] {
-            assert_eq!(tags_meta(&i), None);
-            assert_eq!(tags_suffix(&i), "");
+            assert!(tag_names(&i).is_empty());
         }
     }
 
@@ -2834,6 +3007,155 @@ mod tests {
         // flag wins over a disabling/absent env
         assert!(mute_notifications(true, Some("0")));
         assert!(mute_notifications(true, Some("false")));
+    }
+
+    // ---- agent mode ----
+
+    #[test]
+    fn agent_mode_flag_and_env() {
+        // flag alone
+        assert!(agent_mode(true, None));
+        // env values that enable
+        assert!(agent_mode(false, Some("1")));
+        assert!(agent_mode(false, Some("true")));
+        // env off / absent / unrecognized
+        assert!(!agent_mode(false, None));
+        assert!(!agent_mode(false, Some("0")));
+        assert!(!agent_mode(false, Some("false")));
+        assert!(!agent_mode(false, Some("yes")));
+        assert!(!agent_mode(false, Some("")));
+        // flag wins over a disabling/absent env
+        assert!(agent_mode(true, Some("0")));
+        assert!(agent_mode(true, Some("false")));
+    }
+
+    fn agent_flag(args: &[&str]) -> bool {
+        Cli::try_parse_from(args).unwrap().agent
+    }
+
+    #[test]
+    fn agent_flag_is_global() {
+        assert!(agent_flag(&[
+            "yt", "--agent", "read", "issue", "show", "DEMO-1"
+        ]));
+        assert!(agent_flag(&[
+            "yt",
+            "read",
+            "issue",
+            "ls",
+            "--agent",
+            "project: DEMO"
+        ]));
+        assert!(agent_flag(&[
+            "yt", "write", "issue", "tag", "DEMO-1", "x", "--agent"
+        ]));
+        assert!(!agent_flag(&["yt", "read", "issue", "show", "DEMO-1"]));
+    }
+
+    // ---- ls / show rendering ----
+
+    fn assigned() -> Value {
+        json!({
+            "idReadable": "YT-31",
+            "summary": "do the thing",
+            "tags": [{"name": "wave"}],
+            "customFields": [
+                {"name": "State", "value": {"name": "Open"}},
+                {"name": "Priority", "value": {"name": "Normal"}},
+                {"name": "Assignee", "value": {"login": "claude", "name": "Claude"}},
+            ]
+        })
+    }
+
+    fn unassigned() -> Value {
+        json!({
+            "idReadable": "YT-7",
+            "summary": "nobody on this",
+            "customFields": [
+                {"name": "State", "value": {"name": "Fixed"}},
+                {"name": "Priority", "value": {"name": "Critical"}},
+                {"name": "Assignee", "value": null},
+            ]
+        })
+    }
+
+    fn render_ls(issues: &[Value]) -> Vec<String> {
+        let cells: Vec<[String; 4]> = issues.iter().map(ls_cells).collect();
+        let w = ls_widths(&cells);
+        issues
+            .iter()
+            .zip(&cells)
+            .map(|(i, c)| ls_line(i, c, &w, &Theme::plain()))
+            .collect()
+    }
+
+    #[test]
+    fn ls_shows_assignee_for_assigned_and_unassigned() {
+        assert_eq!(
+            render_ls(&[assigned(), unassigned()]),
+            [
+                "YT-31  Open   Normal    @claude  do the thing #wave",
+                "YT-7   Fixed  Critical  -        nobody on this",
+            ]
+        );
+    }
+
+    #[test]
+    fn ls_falls_back_when_fields_are_missing() {
+        let bare = json!({"summary": "orphan"});
+        assert_eq!(render_ls(&[bare]), ["?  -  -  -  orphan"]);
+        // an empty summary leaves no trailing padding
+        assert_eq!(
+            render_ls(&[json!({"idReadable": "YT-1"})]),
+            ["YT-1  -  -  -"]
+        );
+    }
+
+    #[test]
+    fn show_meta_always_reports_assignee() {
+        let t = Theme::plain();
+        assert_eq!(
+            meta_line(&meta_pairs(&assigned()), &t),
+            "State:Open  Priority:Normal  Assignee:claude  created:-  updated:-  tags:wave"
+        );
+        assert_eq!(
+            meta_line(&meta_pairs(&unassigned()), &t),
+            "State:Fixed  Priority:Critical  Assignee:-  created:-  updated:-"
+        );
+    }
+
+    #[test]
+    fn show_meta_omits_an_assignee_field_the_project_lacks() {
+        let i = json!({
+            "idReadable": "X-1",
+            "customFields": [
+                {"name": "State", "value": {"name": "Open"}},
+                {"name": "Due Date", "value": null},
+            ],
+            "reporter": {"login": "bob"}
+        });
+        assert_eq!(
+            meta_line(&meta_pairs(&i), &Theme::plain()),
+            "State:Open  created:-  updated:-  by:bob"
+        );
+    }
+
+    #[test]
+    fn rich_theme_colours_ls_but_plain_theme_does_not() {
+        let cells = [ls_cells(&assigned())];
+        let w = ls_widths(&cells);
+        let rich = ls_line(&assigned(), &cells[0], &w, &Theme::rich());
+        assert!(rich.contains('\u{1b}'));
+        assert!(!ls_line(&assigned(), &cells[0], &w, &Theme::plain()).contains('\u{1b}'));
+    }
+
+    #[test]
+    fn resolved_and_open_states_style_differently() {
+        assert!(is_resolved("Fixed"));
+        assert!(is_resolved("Done"));
+        assert!(!is_resolved("In Progress"));
+        assert_ne!(state_style("Fixed"), state_style("Open"));
+        assert_ne!(state_style("Open"), state_style("In Progress"));
     }
 
     fn test_client(silent: bool) -> Client {
