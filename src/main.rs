@@ -113,6 +113,9 @@ enum ReadCmd {
         /// $skip pagination
         #[arg(long, value_name = "N")]
         skip: Option<usize>,
+        /// Fetch every page of a collection (conflicts with --top/--skip)
+        #[arg(long, conflicts_with_all = ["top", "skip"])]
+        all: bool,
     },
 }
 
@@ -125,6 +128,9 @@ enum ReadIssueCmd {
         /// Max results
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
+        /// Skip the first N results (next page: --skip <previous skip + n>)
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        skip: usize,
         /// Include descriptions
         #[arg(long)]
         full: bool,
@@ -198,6 +204,9 @@ enum ReadUserCmd {
         /// Max results
         #[arg(short = 'n', long, default_value_t = 10)]
         limit: usize,
+        /// Skip the first N results (next page: --skip <previous skip + n>)
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        skip: usize,
     },
     /// Show the authenticated user
     Me,
@@ -559,6 +568,19 @@ impl Client {
 
     fn get(&self, path: &str, params: &[(&str, &str)]) -> Result<Value> {
         read(self.req("GET", path, params).call())
+    }
+
+    /// GET every page of a collection. Without `$top` YouTrack silently
+    /// returns only its default page (42 items).
+    fn get_all(&self, path: &str, params: &[(&str, &str)]) -> Result<Value> {
+        paginate(PAGE_SIZE, |top, skip| {
+            let (top, skip) = (top.to_string(), skip.to_string());
+            let mut p = params.to_vec();
+            p.push(("$top", &top));
+            p.push(("$skip", &skip));
+            self.get(path, &p)
+        })
+        .map(Value::Array)
     }
 
     fn post(&self, path: &str, params: &[(&str, &str)], body: Value) -> Result<Value> {
@@ -1002,8 +1024,43 @@ fn print_json(v: &Value) -> Result<()> {
     Ok(())
 }
 
-fn limit_hint(limit: usize) -> String {
-    format!("# limit {limit} reached; refine query or raise -n")
+const PAGE_SIZE: usize = 200;
+
+/// Fetch pages of `page` items via `fetch(top, skip)` until a short page.
+fn paginate(
+    page: usize,
+    mut fetch: impl FnMut(usize, usize) -> Result<Value>,
+) -> Result<Vec<Value>> {
+    let mut all = Vec::new();
+    loop {
+        let v = fetch(page, all.len())?;
+        let items = match v {
+            Value::Array(a) => a,
+            other => bail!("expected a JSON array, got: {other}"),
+        };
+        let n = items.len();
+        all.extend(items);
+        if n < page {
+            return Ok(all);
+        }
+    }
+}
+
+const YT_DEFAULT_PAGE: usize = 42;
+
+/// Warn when a raw `read api` array is exactly one page long: it may be truncated.
+fn api_page_hint(v: &Value, all: bool, top: Option<usize>) -> Option<String> {
+    let n = v.as_array()?.len();
+    let page = top.unwrap_or(YT_DEFAULT_PAGE);
+    (!all && n > 0 && n == page)
+        .then(|| format!("# {n} items = one full page; more may exist: use --all or --top/--skip"))
+}
+
+fn limit_hint(limit: usize, skip: usize) -> String {
+    format!(
+        "# limit {limit} reached; next page: --skip {}, or raise -n",
+        skip + limit
+    )
 }
 
 fn visible_projects(projects: &Value, all: bool) -> Vec<Value> {
@@ -1023,10 +1080,7 @@ fn stdin_text() -> Result<String> {
 }
 
 fn resolve_project(c: &Client, key: &str) -> Result<(String, String)> {
-    let projects = c.get(
-        "admin/projects",
-        &[("fields", "id,shortName,name"), ("$top", "500")],
-    )?;
+    let projects = c.get_all("admin/projects", &[("fields", "id,shortName,name")])?;
     projects
         .as_array()
         .into_iter()
@@ -1127,9 +1181,9 @@ fn fieldtype_id_to_cf_type(type_id: &str) -> Option<&'static str> {
 /// back to sampling `$type` off recent issues, which only needs issue-read access
 /// and so works with a plain reporter token.
 fn project_field_types(c: &Client, pid: &str, short: &str) -> Vec<(String, String)> {
-    if let Ok(cfg) = c.get(
+    if let Ok(cfg) = c.get_all(
         &format!("admin/projects/{pid}/customFields"),
-        &[("fields", "field(name,fieldType(id))"), ("$top", "200")],
+        &[("fields", "field(name,fieldType(id))")],
     ) {
         let defs: Vec<(String, String)> = cfg
             .as_array()
@@ -1236,7 +1290,7 @@ fn visibility_payload(public: bool, group_ids: &[String], user_ids: &[String]) -
 }
 
 fn resolve_group(c: &Client, name: &str) -> Result<String> {
-    let groups = c.get("groups", &[("fields", "id,name"), ("$top", "500")])?;
+    let groups = c.get_all("groups", &[("fields", "id,name")])?;
     groups
         .as_array()
         .into_iter()
@@ -1251,10 +1305,7 @@ fn resolve_group(c: &Client, name: &str) -> Result<String> {
 }
 
 fn resolve_user(c: &Client, login: &str) -> Result<String> {
-    let users = c.get(
-        "users",
-        &[("query", login), ("fields", "id,login"), ("$top", "50")],
-    )?;
+    let users = c.get_all("users", &[("query", login), ("fields", "id,login")])?;
     users
         .as_array()
         .into_iter()
@@ -1290,7 +1341,7 @@ fn resolve_visibility(
 
 /// Resolve a tag name to its internal id via GET /api/tags.
 fn resolve_tag(c: &Client, name: &str) -> Result<String> {
-    let tags = c.get("tags", &[("fields", "id,name"), ("$top", "500")])?;
+    let tags = c.get_all("tags", &[("fields", "id,name")])?;
     tags.as_array()
         .into_iter()
         .flatten()
@@ -1362,7 +1413,7 @@ fn servers_json(cfg: &Config) -> Value {
 /// Fetch an issue's pull-request state changes from the activity stream, as
 /// (state, optional url) tuples. One small request scoped to the PR category.
 fn fetch_pr_changes(c: &Client, id: &str) -> Result<Vec<(String, Option<String>)>> {
-    let acts = c.get(
+    let acts = c.get_all(
         &format!("issues/{id}/activities"),
         &[
             ("categories", "PullRequestChangeCategory"),
@@ -1412,7 +1463,7 @@ fn visibility_marker(vis: &Value) -> String {
 }
 
 fn print_comments(c: &Client, id: &str) -> Result<()> {
-    let comments = c.get(
+    let comments = c.get_all(
         &format!("issues/{id}/comments"),
         &[("fields", COMMENT_FIELDS)],
     )?;
@@ -1453,7 +1504,7 @@ fn link_phrase(group: &Value) -> &str {
 
 /// Fetch an issue's links, keeping only groups that actually contain issues.
 fn fetch_links(c: &Client, id: &str, fields: &str) -> Result<Vec<Value>> {
-    let links = c.get(&format!("issues/{id}/links"), &[("fields", fields)])?;
+    let links = c.get_all(&format!("issues/{id}/links"), &[("fields", fields)])?;
     Ok(links
         .as_array()
         .into_iter()
@@ -1492,7 +1543,7 @@ fn print_links(c: &Client, id: &str) -> Result<()> {
 /// Find the link-group id whose relation phrase matches `phrase`
 /// (case-insensitive). Lists the server's accepted phrases on a miss.
 fn resolve_link_group(c: &Client, id: &str, phrase: &str) -> Result<String> {
-    let links = c.get(&format!("issues/{id}/links"), &[("fields", LINK_FIELDS)])?;
+    let links = c.get_all(&format!("issues/{id}/links"), &[("fields", LINK_FIELDS)])?;
     let groups: Vec<Value> = links.as_array().cloned().unwrap_or_default();
     if let Some(g) = groups
         .iter()
@@ -1850,6 +1901,7 @@ fn run() -> Result<()> {
                         ReadIssueCmd::Ls {
                             query,
                             limit,
+                            skip,
                             full,
                             merged_pr,
                         },
@@ -1867,6 +1919,7 @@ fn run() -> Result<()> {
                     ("query", &query),
                     ("fields", &fields),
                     ("$top", &limit.to_string()),
+                    ("$skip", &skip.to_string()),
                 ],
             )?;
             let fetched = issues.as_array().cloned().unwrap_or_default();
@@ -1887,7 +1940,7 @@ fn run() -> Result<()> {
             if json {
                 print_json(&Value::Array(list))?;
                 if fetched.len() == limit {
-                    eprintln!("{}", limit_hint(limit));
+                    eprintln!("{}", limit_hint(limit, skip));
                 }
                 return Ok(());
             }
@@ -1910,7 +1963,7 @@ fn run() -> Result<()> {
                 }
             }
             if fetched.len() == limit {
-                eprintln!("{}", limit_hint(limit));
+                eprintln!("{}", limit_hint(limit, skip));
             }
         }
         Cmd::Read {
@@ -1930,7 +1983,7 @@ fn run() -> Result<()> {
                 let rid = i["idReadable"].as_str().unwrap_or(&id).to_string();
                 let links = fetch_links(&c, &rid, LINK_FIELDS_JSON)?;
                 let cm = if comments {
-                    Some(c.get(
+                    Some(c.get_all(
                         &format!("issues/{rid}/comments"),
                         &[("fields", COMMENT_FIELDS_JSON)],
                     )?)
@@ -2168,7 +2221,7 @@ fn run() -> Result<()> {
             },
         } => {
             if json {
-                let comments = c.get(
+                let comments = c.get_all(
                     &format!("issues/{id}/comments"),
                     &[("fields", COMMENT_FIELDS_JSON)],
                 )?;
@@ -2184,7 +2237,7 @@ fn run() -> Result<()> {
             },
         } => {
             if json {
-                let links = c.get(
+                let links = c.get_all(
                     &format!("issues/{id}/links"),
                     &[("fields", LINK_FIELDS_JSON)],
                 )?;
@@ -2230,7 +2283,7 @@ fn run() -> Result<()> {
             } else {
                 "id,name,size,url"
             };
-            let atts = c.get(&format!("issues/{id}/attachments"), &[("fields", fields)])?;
+            let atts = c.get_all(&format!("issues/{id}/attachments"), &[("fields", fields)])?;
             if json {
                 print_json(&atts)?;
                 return Ok(());
@@ -2310,7 +2363,7 @@ fn run() -> Result<()> {
                 cmd: ReadIssueCmd::Tags,
             },
         } => {
-            let tags = c.get("tags", &[("fields", "id,name"), ("$top", "500")])?;
+            let tags = c.get_all("tags", &[("fields", "id,name")])?;
             if json {
                 print_json(&tags)?;
                 return Ok(());
@@ -2354,7 +2407,7 @@ fn run() -> Result<()> {
             } else {
                 "shortName,name,archived"
             };
-            let projects = c.get("admin/projects", &[("fields", fields), ("$top", "500")])?;
+            let projects = c.get_all("admin/projects", &[("fields", fields)])?;
             let list = visible_projects(&projects, all);
             if json {
                 print_json(&Value::Array(list))?;
@@ -2403,9 +2456,9 @@ fn run() -> Result<()> {
             } else {
                 "canBeEmpty,field(name,fieldType(valueType)),bundle(values(name,archived))"
             };
-            let fields = c.get(
+            let fields = c.get_all(
                 &format!("admin/projects/{pid}/customFields"),
-                &[("fields", field_spec), ("$top", "100")],
+                &[("fields", field_spec)],
             )?;
             if json {
                 print_json(&fields)?;
@@ -2495,7 +2548,7 @@ fn run() -> Result<()> {
             json,
             cmd:
                 ReadCmd::User {
-                    cmd: ReadUserCmd::Ls { query, limit },
+                    cmd: ReadUserCmd::Ls { query, limit, skip },
                 },
         } => {
             let fields = if json {
@@ -2503,10 +2556,15 @@ fn run() -> Result<()> {
             } else {
                 "login,name"
             };
-            let top = limit.to_string();
+            let (top, skp) = (limit.to_string(), skip.to_string());
             let users = c.get(
                 "users",
-                &[("query", &query), ("fields", fields), ("$top", &top)],
+                &[
+                    ("query", &query),
+                    ("fields", fields),
+                    ("$top", &top),
+                    ("$skip", &skp),
+                ],
             )?;
             let list = users.as_array().cloned().unwrap_or_default();
             if json {
@@ -2524,7 +2582,7 @@ fn run() -> Result<()> {
                 }
             }
             if list.len() == limit {
-                eprintln!("{}", limit_hint(limit));
+                eprintln!("{}", limit_hint(limit, skip));
             }
         }
         Cmd::Read {
@@ -2535,6 +2593,7 @@ fn run() -> Result<()> {
                     query,
                     top,
                     skip,
+                    all,
                 },
             ..
         } => {
@@ -2543,7 +2602,15 @@ fn run() -> Result<()> {
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            let v = c.get(path.trim_start_matches('/'), &refs)?;
+            let path = path.trim_start_matches('/');
+            let v = if all {
+                c.get_all(path, &refs)?
+            } else {
+                c.get(path, &refs)?
+            };
+            if let Some(hint) = api_page_hint(&v, all, top) {
+                eprintln!("{hint}");
+            }
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Cmd::Read {
@@ -3657,6 +3724,67 @@ mod tests {
     #[test]
     fn api_params_rejects_query_without_equals() {
         assert!(api_params(None, &["noequals".into()], None, None).is_err());
+    }
+
+    fn fake_collection(total: usize) -> impl FnMut(usize, usize) -> Result<Value> {
+        move |top, skip| Ok(json!((skip..total.min(skip + top)).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn paginate_fetches_past_the_first_page() {
+        let mut calls = vec![];
+        let mut inner = fake_collection(64);
+        let all = paginate(42, |t, s| {
+            calls.push((t, s));
+            inner(t, s)
+        })
+        .unwrap();
+        assert_eq!(all, (0..64).map(|i| json!(i)).collect::<Vec<_>>());
+        assert_eq!(calls, [(42, 0), (42, 42)]);
+    }
+
+    #[test]
+    fn paginate_exact_multiple_ends_on_empty_page() {
+        let mut calls = 0;
+        let mut inner = fake_collection(10);
+        let all = paginate(5, |t, s| {
+            calls += 1;
+            inner(t, s)
+        })
+        .unwrap();
+        assert_eq!(all.len(), 10);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn paginate_rejects_non_array() {
+        assert!(paginate(5, |_, _| Ok(json!({"id": "x"}))).is_err());
+    }
+
+    #[test]
+    fn api_page_hint_flags_full_default_page_only() {
+        let page = |n: usize| json!(vec![0; n]);
+        assert!(api_page_hint(&page(42), false, None).is_some());
+        assert!(api_page_hint(&page(41), false, None).is_none());
+        assert!(api_page_hint(&page(42), true, None).is_none());
+        assert!(api_page_hint(&page(10), false, Some(10)).is_some());
+        assert!(api_page_hint(&json!({"id": "x"}), false, None).is_none());
+    }
+
+    #[test]
+    fn limit_hint_points_at_next_page() {
+        assert!(limit_hint(20, 40).contains("--skip 60"));
+    }
+
+    #[test]
+    fn ls_skip_and_api_all_parse() {
+        let parse = |a: &[&str]| Cli::try_parse_from(a).is_ok();
+        assert!(parse(&["yt", "read", "issue", "ls", "q", "--skip", "20"]));
+        assert!(parse(&["yt", "read", "user", "ls", "bob", "--skip", "10"]));
+        assert!(parse(&["yt", "read", "api", "tags", "--all"]));
+        assert!(!parse(&[
+            "yt", "read", "api", "tags", "--all", "--top", "5"
+        ]));
     }
 
     // ---- self-update helpers ----

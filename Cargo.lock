@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "yt"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anstream 0.6.21",
  "anstyle",
