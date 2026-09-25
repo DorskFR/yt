@@ -72,13 +72,14 @@ legacy single-server `config.json` is read transparently as the `default` server
 
 ```
 # read tier — never mutates
-yt read issue ls "QUERY" [-n 20] [--full] [--merged-pr]   search; one line per issue: ID  STATE  PRIO  SUMMARY [#tag ...]
-                                            (a `# limit N reached` hint goes to stderr when -n is hit;
+yt read issue ls "QUERY" [-n 20] [--skip N] [--full] [--merged-pr]   search; one line per issue: ID  STATE  PRIO  SUMMARY [#tag ...]
+                                            (a `# limit N reached; next page: --skip M` hint goes to stderr when -n is hit;
                                             --merged-pr keeps only issues with a merged PR, one extra call per row)
 yt read issue show ID [-c] [--pr]           issue detail (fields, tags, links); -c appends comments, --pr linked PRs
 yt read issue open ID [-p]                  print ID  SUMMARY + web URL, then open it in the browser
                                             (-p/--print-only, --json, or a non-TTY stdout skip the launch)
-yt read issue comments ID                   list comments
+yt read issue comments ID                   list all comments (comments, links, attachments, tags
+                                            and projects are always fetched in full, page by page)
 yt read issue links ID                      list links (PHRASE  ID  SUMMARY), grouped by relation
 yt read issue attachments ID [-o DIR]       list attachments (NAME SIZE); -o downloads to DIR (default .)
 yt read issue tags                          list tags (one name per line)
@@ -86,10 +87,12 @@ yt read project ls [--all]                  list projects (SHORT  NAME); --all i
 yt read project fields PROJECT              fields + allowed values (falls back to observed
                                             values when the token lacks project-admin rights)
 yt read user me                             authenticated user
-yt read user ls QUERY [-n N]                search users by name/login (default 10)
+yt read user ls QUERY [-n N] [--skip N]     search users by name/login (default 10)
 yt read server ls                           list configured servers (* marks the default)
 yt read query-help                          query syntax cheat sheet
-yt read api PATH [--fields F] [--query K=V]... [--top N] [--skip N]   raw authenticated GET on /api/PATH; prints JSON
+yt read api PATH [--fields F] [--query K=V]... [--top N] [--skip N] [--all]   raw authenticated GET on /api/PATH; prints JSON
+                                            (YouTrack returns 42 items without --top; --all fetches every page,
+                                            and a stderr hint flags a response that is exactly one full page)
 
 # write tier — mutates issues / projects / local config / the binary
 yt write issue new PROJECT "SUMMARY" [-d DESC|-d -] [-f "Priority Critical"]...  prints new ID only
@@ -229,7 +232,7 @@ uses `yt` instead of a heavier MCP integration:
 ## YouTrack
 Use the `yt` CLI for issue tracking (auth already configured). Commands live
 under `yt read …` (safe) or `yt write …` (mutating):
-- `yt read issue ls "project: DEMO #Unresolved sort by: updated desc" [-n N] [--full]` — search
+- `yt read issue ls "project: DEMO #Unresolved sort by: updated desc" [-n N] [--skip N] [--full]` — search
 - `yt read issue show DEMO-1 [-c] [--pr]` — detail (+comments/PRs); `yt read issue comments DEMO-1`
 - `yt read issue open DEMO-1 [-p]` — print the web URL and open it in a browser (`-p` prints only)
 - `yt write issue new DEMO "summary" -d - [-f "Priority Critical"]` — create, desc from stdin, prints ID
@@ -243,7 +246,7 @@ under `yt read …` (safe) or `yt write …` (mutating):
 - `yt write issue cmd "State Done assignee me" DEMO-1 DEMO-2 [-m "note"]` — batch state/assign/etc.
 - `yt read issue tags` — list tags; `yt write issue tag DEMO-1 Blocked` / `yt write issue untag DEMO-1 Blocked` — add/remove tag
 - `yt read project ls`, `yt read project fields DEMO`, `yt read query-help` — discovery
-- `yt read --json issue show DEMO-1` — raw JSON with entity ids; `yt read api issues/DEMO-1/comments --fields id,text` — any GET
+- `yt read --json issue show DEMO-1` — raw JSON with entity ids; `yt read api issues/DEMO-1/comments --fields id,text --all` — any GET (`--all` pages through collections)
 - `--silent` on any write mutes watcher notifications
 ```
 
