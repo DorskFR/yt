@@ -205,8 +205,9 @@ stdout/stderr is not a TTY (e.g. piped to a file or another program) and honors
 the `NO_COLOR` and `CLICOLOR`/`CLICOLOR_FORCE` environment variables — agent-safe
 by default.
 
-`-f` on `write issue new` uses YouTrack command syntax and is applied right after
-creation (`-f "Priority Critical" -f "Type Bug"`).
+`-f` on `write issue new` uses YouTrack command syntax (`-f "Priority Critical" -f "Type Bug"`).
+Fields whose type can be resolved are set atomically in the create call; otherwise
+(unknown field type, `Assignee me`, ...) they are applied as a command right after creation.
 
 `yt write project create` requires a token with **admin permissions** (it POSTs to
 `/api/admin/projects`); a non-admin token returns `HTTP 403` and the server's

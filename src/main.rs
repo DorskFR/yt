@@ -126,7 +126,7 @@ enum ReadIssueCmd {
         /// YouTrack query, e.g. "project: DEMO #Unresolved sort by: updated desc"
         query: String,
         /// Max results
-        #[arg(short = 'n', long, default_value_t = 20)]
+        #[arg(short = 'n', long, default_value_t = 20, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
         limit: usize,
         /// Skip the first N results (next page: --skip <previous skip + n>)
         #[arg(long, value_name = "N", default_value_t = 0)]
@@ -202,7 +202,7 @@ enum ReadUserCmd {
         /// Name or login fragment to search for
         query: String,
         /// Max results
-        #[arg(short = 'n', long, default_value_t = 10)]
+        #[arg(short = 'n', long, default_value_t = 10, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
         limit: usize,
         /// Skip the first N results (next page: --skip <previous skip + n>)
         #[arg(long, value_name = "N", default_value_t = 0)]
@@ -252,7 +252,7 @@ enum WriteIssueCmd {
         /// Issue summary (title)
         summary: String,
         /// Description ("-" reads stdin)
-        #[arg(short, long)]
+        #[arg(short, long, allow_hyphen_values = true)]
         desc: Option<String>,
         /// Field assignment in command syntax, repeatable, e.g. -f "Priority Critical" -f "State In Progress" (field names vary by project — see `yt read project fields <PROJECT>`)
         #[arg(short, long)]
@@ -263,10 +263,10 @@ enum WriteIssueCmd {
         /// Issue id, e.g. DEMO-1
         id: String,
         /// New summary
-        #[arg(short, long)]
+        #[arg(short, long, allow_hyphen_values = true)]
         summary: Option<String>,
         /// New description ("-" reads stdin)
-        #[arg(short, long)]
+        #[arg(short, long, allow_hyphen_values = true)]
         desc: Option<String>,
     },
     /// Attach one or more files to an issue (or a comment with -c)
@@ -425,9 +425,14 @@ struct Config {
 
 impl Config {
     fn load() -> Result<Self> {
-        let path = config_path();
-        let Ok(s) = std::fs::read_to_string(&path) else {
-            return Ok(Self::default());
+        Self::load_from(&config_path())
+    }
+
+    fn load_from(path: &std::path::Path) -> Result<Self> {
+        let s = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
         let cfg: Value = serde_json::from_str(&s)
             .with_context(|| format!("invalid JSON in {}", path.display()))?;
@@ -469,7 +474,14 @@ impl Config {
     }
 
     fn save(&self) -> Result<()> {
-        let path = config_path();
+        self.save_to(&config_path())
+    }
+
+    /// Write via a 0600 temp file + rename so the token is never world-readable
+    /// and a crash can't leave a truncated config.
+    fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         std::fs::create_dir_all(path.parent().context("no config dir")?)?;
         let servers: serde_json::Map<String, Value> = self
             .servers
@@ -477,12 +489,21 @@ impl Config {
             .map(|(name, (u, t))| (name.clone(), json!({"url": u, "token": t})))
             .collect();
         let cfg = json!({"default": self.default, "servers": servers});
-        std::fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
+        let tmp = path.with_extension("json.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
         }
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.write_all(serde_json::to_string_pretty(&cfg)?.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
         Ok(())
     }
 }
@@ -678,6 +699,28 @@ fn header_quote(name: &str) -> String {
             c => vec![c],
         })
         .collect()
+}
+
+/// Keep same-named attachments from overwriting each other in one download:
+/// later duplicates get the attachment id before the extension. Pure.
+fn unique_file_name(
+    name: String,
+    id: &str,
+    used: &mut std::collections::HashSet<String>,
+) -> String {
+    if used.insert(name.clone()) {
+        return name;
+    }
+    let p = std::path::Path::new(&name);
+    let alt = match (
+        p.file_stem().and_then(|s| s.to_str()),
+        p.extension().and_then(|e| e.to_str()),
+    ) {
+        (Some(stem), Some(ext)) => format!("{stem}-{id}.{ext}"),
+        _ => format!("{name}-{id}"),
+    };
+    used.insert(alt.clone());
+    alt
 }
 
 fn safe_file_name(name: &str, fallback: &str) -> String {
@@ -1026,7 +1069,8 @@ fn print_json(v: &Value) -> Result<()> {
 
 const PAGE_SIZE: usize = 200;
 
-/// Fetch pages of `page` items via `fetch(top, skip)` until a short page.
+/// Fetch pages of `page` items via `fetch(top, skip)` until a short page, or an
+/// oversized one (the server ignored `$top` and returned everything).
 fn paginate(
     page: usize,
     mut fetch: impl FnMut(usize, usize) -> Result<Value>,
@@ -1040,7 +1084,7 @@ fn paginate(
         };
         let n = items.len();
         all.extend(items);
-        if n < page {
+        if n != page {
             return Ok(all);
         }
     }
@@ -1128,7 +1172,11 @@ fn issue_cf_entry(name: &str, cf_type: &str, raw: &str) -> Option<Value> {
         | "SingleGroupIssueCustomField"
         | "MultiGroupIssueCustomField" => wrap(json!({"name": val})),
         "StateIssueCustomField" | "StateMachineIssueCustomField" => json!({"name": val}),
-        "SingleUserIssueCustomField" | "MultiUserIssueCustomField" => wrap(json!({"login": val})),
+        "SingleUserIssueCustomField" | "MultiUserIssueCustomField"
+            if !val.eq_ignore_ascii_case("me") =>
+        {
+            wrap(json!({"login": val}))
+        }
         "TextIssueCustomField" => json!({"text": val}),
         "PeriodIssueCustomField" => json!({"presentation": val}),
         // integer / float / string all use SimpleIssueCustomField; infer the JSON
@@ -1397,6 +1445,15 @@ fn show_json(
             .collect();
     }
     issue
+}
+
+fn user_line(u: &Value) -> String {
+    let login = u["login"].as_str().unwrap_or("?");
+    [u["name"].as_str(), u["email"].as_str()]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .fold(login.to_string(), |acc, s| format!("{acc}  {s}"))
 }
 
 /// `server ls --json` records: name, url, default flag. Tokens never leave the
@@ -1684,20 +1741,29 @@ fn maybe_print_update_notice() {
 
     if now_secs().saturating_sub(checked_at) >= UPDATE_CHECK_INTERVAL_SECS {
         // stale (or absent): refresh in the foreground but time-boxed.
+        // A failed check is cached too, so offline runs don't retry every time.
         if let Ok((_, v)) = fetch_latest_release() {
-            latest = v.clone();
-            let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
-            let _ = std::fs::write(
-                &path,
-                serde_json::to_string(&json!({"checked_at": now_secs(), "latest": v}))
-                    .unwrap_or_default(),
-            );
+            latest = v;
         }
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+        let _ = std::fs::write(
+            &path,
+            serde_json::to_string(&json!({"checked_at": now_secs(), "latest": latest}))
+                .unwrap_or_default(),
+        );
     }
 
     if !latest.is_empty() && is_newer(&latest, current) {
         eprintln!("update available: {current} -> {latest} (run: yt write update)");
     }
+}
+
+/// The hash for exactly `asset` in `sha256sum` output (text or `*binary` mode). Pure.
+fn checksum_for(sums: &str, asset: &str) -> Option<String> {
+    sums.lines().find_map(|l| {
+        let (hash, name) = l.split_once(char::is_whitespace)?;
+        (name.trim().trim_start_matches('*') == asset).then(|| hash.to_string())
+    })
 }
 
 /// Download the latest release binary for this platform, verify its sha256
@@ -1729,12 +1795,7 @@ fn self_update(force: bool) -> Result<()> {
         Ok(r) => r.into_string()?,
         Err(e) => bail!("fetching SHA256SUMS: {e}"),
     };
-    let want = sums
-        .lines()
-        .find_map(|l| {
-            let (hash, name) = l.split_once(char::is_whitespace)?;
-            name.trim().ends_with(asset).then(|| hash.to_string())
-        })
+    let want = checksum_for(&sums, asset)
         .with_context(|| format!("no checksum for {asset} in SHA256SUMS"))?;
 
     // Download the binary into memory and verify before touching disk.
@@ -1762,15 +1823,22 @@ fn self_update(force: bool) -> Result<()> {
 
     // Atomic-ish replace: write next to the current exe, then rename over it.
     // rename(2) swaps the inode, so a running process keeps its old text pages.
-    let exe = std::env::current_exe().context("cannot locate current executable")?;
+    let exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .context("cannot locate current executable")?;
     let dir = exe.parent().context("executable has no parent dir")?;
     let tmp = dir.join(format!(".yt-update-{}", std::process::id()));
-    std::fs::write(&tmp, &bytes).with_context(|| {
-        format!(
+    std::fs::File::create(&tmp)
+        .and_then(|mut f| {
+            std::io::Write::write_all(&mut f, &bytes)?;
+            f.sync_all()
+        })
+        .with_context(|| {
+            format!(
             "cannot write to {} — is the install dir writable? (try with appropriate permissions)",
             dir.display()
         )
-    })?;
+        })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2306,9 +2374,14 @@ fn run() -> Result<()> {
                 Some(dir) => {
                     let dir = dir.as_deref().unwrap_or(".");
                     std::fs::create_dir_all(dir)?;
+                    let mut used = std::collections::HashSet::new();
                     for a in &list {
                         let id = a["id"].as_str().unwrap_or("unknown");
-                        let name = safe_file_name(a["name"].as_str().unwrap_or(""), id);
+                        let name = unique_file_name(
+                            safe_file_name(a["name"].as_str().unwrap_or(""), id),
+                            id,
+                            &mut used,
+                        );
                         let url = a["url"]
                             .as_str()
                             .with_context(|| format!("attachment '{name}' has no url"))?;
@@ -2537,12 +2610,7 @@ fn run() -> Result<()> {
                 print_json(&u)?;
                 return Ok(());
             }
-            println!(
-                "{}  {}  {}",
-                u["login"].as_str().unwrap_or("?"),
-                u["name"].as_str().unwrap_or(""),
-                u["email"].as_str().unwrap_or("")
-            );
+            println!("{}", user_line(&u));
         }
         Cmd::Read {
             json,
@@ -3015,6 +3083,54 @@ mod tests {
                 {"state": "MERGED", "url": null}
             ])
         );
+    }
+
+    #[test]
+    fn desc_and_summary_accept_leading_hyphen() {
+        for argv in [
+            &[
+                "yt",
+                "write",
+                "issue",
+                "new",
+                "X",
+                "s",
+                "-d",
+                "-f is a flag",
+            ][..],
+            &[
+                "yt", "write", "issue", "edit", "X-1", "-s", "- item", "-d", "--x",
+            ][..],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn zero_limit_is_rejected() {
+        for argv in [
+            ["yt", "read", "issue", "ls", "project: X", "-n", "0"],
+            ["yt", "read", "user", "ls", "bob", "-n", "0"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+        assert!(
+            Cli::try_parse_from(["yt", "read", "issue", "ls", "project: X", "-n", "1"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn user_line_skips_empty_fields() {
+        assert_eq!(
+            user_line(&json!({"login": "a", "name": "A B", "email": "a@x"})),
+            "a  A B  a@x"
+        );
+        assert_eq!(
+            user_line(&json!({"login": "claude", "name": "claude", "email": ""})),
+            "claude  claude"
+        );
+        assert_eq!(user_line(&json!({"login": "bot"})), "bot");
+        assert_eq!(user_line(&json!({})), "?");
     }
 
     #[test]
@@ -3545,6 +3661,12 @@ mod tests {
     }
 
     #[test]
+    fn issue_cf_entry_user_me_falls_back_to_commands() {
+        assert!(issue_cf_entry("Assignee", "SingleUserIssueCustomField", "me").is_none());
+        assert!(issue_cf_entry("Assignee", "SingleUserIssueCustomField", "alice").is_some());
+    }
+
+    #[test]
     fn issue_cf_entry_single_enum() {
         assert_eq!(
             issue_cf_entry("Priority", "SingleEnumIssueCustomField", "Critical"),
@@ -3754,6 +3876,93 @@ mod tests {
         .unwrap();
         assert_eq!(all.len(), 10);
         assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn paginate_stops_when_server_ignores_top() {
+        let mut calls = 0;
+        let all = paginate(5, |_, _| {
+            calls += 1;
+            Ok(json!((0..7).collect::<Vec<_>>()))
+        })
+        .unwrap();
+        assert_eq!(all.len(), 7);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn checksum_for_matches_exact_asset_only() {
+        let sums = "aaa  xyz-yt-linux-amd64\nbbb  yt-linux-amd64\nccc *yt-darwin-arm64\n";
+        assert_eq!(checksum_for(sums, "yt-linux-amd64").as_deref(), Some("bbb"));
+        assert_eq!(
+            checksum_for(sums, "yt-darwin-arm64").as_deref(),
+            Some("ccc")
+        );
+        assert_eq!(checksum_for(sums, "yt-linux-arm64"), None);
+    }
+
+    #[test]
+    fn unique_file_name_suffixes_duplicates() {
+        let mut used = std::collections::HashSet::new();
+        assert_eq!(
+            unique_file_name("image.png".into(), "1-1", &mut used),
+            "image.png"
+        );
+        assert_eq!(
+            unique_file_name("image.png".into(), "1-2", &mut used),
+            "image-1-2.png"
+        );
+        assert_eq!(
+            unique_file_name("README".into(), "1-3", &mut used),
+            "README"
+        );
+        assert_eq!(
+            unique_file_name("README".into(), "1-4", &mut used),
+            "README-1-4"
+        );
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("yt-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn config_load_missing_is_empty_but_unreadable_errors() {
+        let d = scratch_dir("cfg-load");
+        let cfg = Config::load_from(&d.join("absent.json")).unwrap();
+        assert!(cfg.servers.is_empty());
+        assert!(Config::load_from(&d).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn config_save_round_trips_with_private_mode() {
+        let d = scratch_dir("cfg-save");
+        let path = d.join("yt/config.json");
+        let cfg = Config {
+            default: Some("home".into()),
+            servers: [(
+                "home".to_string(),
+                ("https://h.example.com".to_string(), "tok".to_string()),
+            )]
+            .into(),
+        };
+        cfg.save_to(&path).unwrap();
+        cfg.save_to(&path).unwrap();
+        let back = Config::load_from(&path).unwrap();
+        assert_eq!(back.default.as_deref(), Some("home"));
+        assert_eq!(back.servers, cfg.servers);
+        assert!(!path.with_extension("json.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
