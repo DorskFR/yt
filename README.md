@@ -65,8 +65,10 @@ yt --server acme read issue ls "project: ACME #Unresolved"  # one-off override f
 ```
 
 Resolution order for every command: `YOUTRACK_URL`/`YOUTRACK_API_TOKEN` env vars
-(when no `--server` is given) → `--server NAME` → the configured default. A
-legacy single-server `config.json` is read transparently as the `default` server.
+(when no `--server` is given) → `--server NAME` → the configured default. The
+env vars only apply as a pair; if just one is set, `yt` warns on stderr and uses
+the configured server. A legacy single-server `config.json` is read transparently
+as the `default` server.
 
 ## Usage
 
