@@ -519,10 +519,59 @@ fn normalize_base(url: &str) -> String {
     }
 }
 
+/// Percent-encode one URL path segment so a user-supplied id can never
+/// address another resource. Unreserved characters pass through, so valid
+/// ids (`DEMO-1`, `0-12`) are unchanged. Pure.
+fn seg(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 struct Client {
     base: String,
     token: String,
     silent: bool,
+    agent: ureq::Agent,
+}
+
+/// One HTTP agent for the process. HTTP error statuses are returned as
+/// responses so the server's error body can be reported; proxies are not
+/// read from the environment.
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .proxy(None)
+        .max_redirects(5)
+        .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .build()
+        .new_agent()
+}
+
+/// Query pairs for an API request: the caller's params plus the mute flag on
+/// mutating methods when silent. Pure.
+fn query_params<'a>(
+    silent: bool,
+    method: &str,
+    params: &[(&'a str, &'a str)],
+) -> Vec<(&'a str, &'a str)> {
+    let mut p = params.to_vec();
+    if silent && matches!(method, "POST" | "PUT" | "DELETE") {
+        p.push(("muteUpdateNotifications", "true"));
+    }
+    p
 }
 
 /// Whether mutating writes should suppress notifications. The `--silent` flag
@@ -551,10 +600,26 @@ fn set_agent_mode(on: bool) {
     }
 }
 
+/// Warning for a half-set env pair: the vars only apply together, so one on
+/// its own is almost certainly a mistake. Pure.
+fn half_env_warning(has_url: bool, has_token: bool) -> Option<String> {
+    let missing = match (has_url, has_token) {
+        (true, false) => "YOUTRACK_API_TOKEN",
+        (false, true) => "YOUTRACK_URL",
+        _ => return None,
+    };
+    Some(format!(
+        "warning: {missing} is not set; YOUTRACK_URL and YOUTRACK_API_TOKEN are only used together, falling back to the configured server"
+    ))
+}
+
 impl Client {
     fn resolve(server: Option<&str>, silent: bool) -> Result<Self> {
         let env_url = std::env::var("YOUTRACK_URL").ok();
         let env_token = std::env::var("YOUTRACK_API_TOKEN").ok();
+        if let Some(w) = half_env_warning(env_url.is_some(), env_token.is_some()) {
+            eprintln!("{w}");
+        }
         let (url, token) = match (env_url, env_token) {
             // both env vars present (and no explicit --server): use them directly
             (Some(u), Some(t)) if server.is_none() => (u, t),
@@ -567,28 +632,42 @@ impl Client {
                 (u.clone(), t.clone())
             }
         };
-        Ok(Self {
+        Ok(Self::new(url, token, silent))
+    }
+
+    fn new(url: String, token: String, silent: bool) -> Self {
+        Self {
             base: normalize_base(&url),
             token,
             silent,
-        })
+            agent: http_agent(),
+        }
     }
 
-    fn req(&self, method: &str, path: &str, params: &[(&str, &str)]) -> ureq::Request {
-        let mut r = ureq::request(method, &format!("{}/{}", self.base, path))
-            .set("Authorization", &format!("Bearer {}", self.token))
-            .set("Accept", "application/json");
-        for (k, v) in params {
+    fn url(&self, path: &str) -> String {
+        format!("{}/{}", self.base, path)
+    }
+
+    fn prepare<B>(
+        &self,
+        method: &str,
+        mut r: ureq::RequestBuilder<B>,
+        params: &[(&str, &str)],
+    ) -> ureq::RequestBuilder<B> {
+        r = r
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Accept", "application/json");
+        for (k, v) in query_params(self.silent, method, params) {
             r = r.query(k, v);
-        }
-        if self.silent && matches!(method, "POST" | "PUT" | "DELETE") {
-            r = r.query("muteUpdateNotifications", "true");
         }
         r
     }
 
     fn get(&self, path: &str, params: &[(&str, &str)]) -> Result<Value> {
-        read(self.req("GET", path, params).call())
+        read(
+            self.prepare("GET", self.agent.get(self.url(path)), params)
+                .call(),
+        )
     }
 
     /// GET every page of a collection. Without `$top` YouTrack silently
@@ -605,11 +684,17 @@ impl Client {
     }
 
     fn post(&self, path: &str, params: &[(&str, &str)], body: Value) -> Result<Value> {
-        read(self.req("POST", path, params).send_json(body))
+        read(
+            self.prepare("POST", self.agent.post(self.url(path)), params)
+                .send_json(body),
+        )
     }
 
     fn delete(&self, path: &str) -> Result<Value> {
-        read(self.req("DELETE", path, &[]).call())
+        read(
+            self.prepare("DELETE", self.agent.delete(self.url(path)), &[])
+                .call(),
+        )
     }
 
     /// Host root (base minus the trailing `/api`), for building web/file URLs.
@@ -630,7 +715,7 @@ impl Client {
 
     /// Browser URL for an issue, e.g. https://yt.example.com/issue/YT-1.
     fn web_url(&self, id: &str) -> String {
-        format!("{}/issue/{}", self.host(), id)
+        format!("{}/issue/{}", self.host(), seg(id))
     }
 
     /// Fetch raw bytes from a root-relative URL (the attachment `url` field is
@@ -638,21 +723,17 @@ impl Client {
     /// "/youtrack/api/files/..."), with the auth header.
     fn get_bytes(&self, rel_url: &str) -> Result<Vec<u8>> {
         let url = format!("{}{rel_url}", self.origin());
-        let res = ureq::get(&url)
-            .set("Authorization", &format!("Bearer {}", self.token))
+        let res = self
+            .agent
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.token))
             .call();
-        match res {
-            Ok(r) => {
-                let mut buf = Vec::new();
-                r.into_reader().read_to_end(&mut buf)?;
-                Ok(buf)
-            }
-            Err(ureq::Error::Status(code, r)) => {
-                let body = r.into_string().unwrap_or_default();
-                bail!("HTTP {code}: {body}")
-            }
-            Err(e) => bail!(e.to_string()),
-        }
+        let mut buf = Vec::new();
+        check(res)?
+            .into_body()
+            .into_reader()
+            .read_to_end(&mut buf)?;
+        Ok(buf)
     }
 
     /// POST a single file as multipart/form-data (field name `file`) to a
@@ -680,12 +761,9 @@ impl Client {
         body.extend_from_slice(&data);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let res = self
-            .req("POST", path, params)
-            .set(
-                "Content-Type",
-                &format!("multipart/form-data; boundary={boundary}"),
-            )
-            .send_bytes(&body);
+            .prepare("POST", self.agent.post(self.url(path)), params)
+            .content_type(format!("multipart/form-data; boundary={boundary}"))
+            .send(&body[..]);
         read(res)
     }
 }
@@ -748,29 +826,42 @@ fn content_type(name: &str) -> &'static str {
     }
 }
 
-fn read(res: Result<ureq::Response, ureq::Error>) -> Result<Value> {
-    match res {
-        Ok(r) => {
-            let s = r.into_string()?;
-            Ok(if s.is_empty() {
-                Value::Null
-            } else {
-                serde_json::from_str(&s)?
-            })
-        }
-        Err(ureq::Error::Status(code, r)) => {
-            let body = r.into_string().unwrap_or_default();
-            let msg = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|v| {
-                    let d = v["error_description"].as_str().or(v["error"].as_str())?;
-                    Some(d.to_string())
-                })
-                .unwrap_or(body);
-            bail!("HTTP {code}: {msg}")
-        }
+type HttpResponse = ureq::http::Response<ureq::Body>;
+
+/// The server's error message for an HTTP error body: YouTrack's
+/// `error_description`/`error` when the body is JSON, the raw body otherwise. Pure.
+fn http_error_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            let d = v["error_description"].as_str().or(v["error"].as_str())?;
+            Some(d.to_string())
+        })
+        .unwrap_or_else(|| body.to_string())
+}
+
+/// Turn transport failures and 4xx/5xx statuses into errors, keeping the
+/// server's message. Anything else is handed back for reading.
+fn check(res: Result<HttpResponse, ureq::Error>) -> Result<HttpResponse> {
+    let mut r = match res {
+        Ok(r) => r,
         Err(e) => bail!(e.to_string()),
+    };
+    let code = r.status().as_u16();
+    if code >= 400 {
+        let body = r.body_mut().read_to_string().unwrap_or_default();
+        bail!("HTTP {code}: {}", http_error_message(&body))
     }
+    Ok(r)
+}
+
+fn read(res: Result<HttpResponse, ureq::Error>) -> Result<Value> {
+    let s = check(res)?.body_mut().read_to_string()?;
+    Ok(if s.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&s)?
+    })
 }
 
 /// Epoch millis -> YYYY-MM-DD (civil-from-days, Hinnant).
@@ -1230,7 +1321,7 @@ fn fieldtype_id_to_cf_type(type_id: &str) -> Option<&'static str> {
 /// and so works with a plain reporter token.
 fn project_field_types(c: &Client, pid: &str, short: &str) -> Vec<(String, String)> {
     if let Ok(cfg) = c.get_all(
-        &format!("admin/projects/{pid}/customFields"),
+        &format!("admin/projects/{}/customFields", seg(pid)),
         &[("fields", "field(name,fieldType(id))")],
     ) {
         let defs: Vec<(String, String)> = cfg
@@ -1471,7 +1562,7 @@ fn servers_json(cfg: &Config) -> Value {
 /// (state, optional url) tuples. One small request scoped to the PR category.
 fn fetch_pr_changes(c: &Client, id: &str) -> Result<Vec<(String, Option<String>)>> {
     let acts = c.get_all(
-        &format!("issues/{id}/activities"),
+        &format!("issues/{}/activities", seg(id)),
         &[
             ("categories", "PullRequestChangeCategory"),
             ("fields", PR_ACTIVITY_FIELDS),
@@ -1521,7 +1612,7 @@ fn visibility_marker(vis: &Value) -> String {
 
 fn print_comments(c: &Client, id: &str) -> Result<()> {
     let comments = c.get_all(
-        &format!("issues/{id}/comments"),
+        &format!("issues/{}/comments", seg(id)),
         &[("fields", COMMENT_FIELDS)],
     )?;
     let list: Vec<Value> = comments
@@ -1561,7 +1652,7 @@ fn link_phrase(group: &Value) -> &str {
 
 /// Fetch an issue's links, keeping only groups that actually contain issues.
 fn fetch_links(c: &Client, id: &str, fields: &str) -> Result<Vec<Value>> {
-    let links = c.get_all(&format!("issues/{id}/links"), &[("fields", fields)])?;
+    let links = c.get_all(&format!("issues/{}/links", seg(id)), &[("fields", fields)])?;
     Ok(links
         .as_array()
         .into_iter()
@@ -1600,7 +1691,10 @@ fn print_links(c: &Client, id: &str) -> Result<()> {
 /// Find the link-group id whose relation phrase matches `phrase`
 /// (case-insensitive). Lists the server's accepted phrases on a miss.
 fn resolve_link_group(c: &Client, id: &str, phrase: &str) -> Result<String> {
-    let links = c.get_all(&format!("issues/{id}/links"), &[("fields", LINK_FIELDS)])?;
+    let links = c.get_all(
+        &format!("issues/{}/links", seg(id)),
+        &[("fields", LINK_FIELDS)],
+    )?;
     let groups: Vec<Value> = links.as_array().cloned().unwrap_or_default();
     if let Some(g) = groups
         .iter()
@@ -1624,7 +1718,7 @@ fn resolve_link_group(c: &Client, id: &str, phrase: &str) -> Result<String> {
 /// Resolve an issue's readable id to its internal database id (needed to
 /// address a link's target on delete).
 fn internal_id(c: &Client, id: &str) -> Result<String> {
-    let i = c.get(&format!("issues/{id}"), &[("fields", "id")])?;
+    let i = c.get(&format!("issues/{}", seg(id)), &[("fields", "id")])?;
     i["id"]
         .as_str()
         .map(String::from)
@@ -1710,10 +1804,13 @@ fn newest_semver_tag(releases: &Value) -> Option<(String, String)> {
 /// Time-boxed; any failure is an error the caller can swallow.
 fn fetch_latest_release() -> Result<(String, String)> {
     let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=20");
-    let res = ureq::get(&url)
-        .set("User-Agent", &format!("yt/{}", env!("CARGO_PKG_VERSION")))
-        .set("Accept", "application/vnd.github+json")
-        .timeout(std::time::Duration::from_secs(4))
+    let res = http_agent()
+        .get(&url)
+        .header("User-Agent", format!("yt/{}", env!("CARGO_PKG_VERSION")))
+        .header("Accept", "application/vnd.github+json")
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(4)))
+        .build()
         .call();
     let v = read(res)?;
     newest_semver_tag(&v).context("no semver release found")
@@ -1787,32 +1884,35 @@ fn self_update(force: bool) -> Result<()> {
     let ua = format!("yt/{current}");
 
     // Fetch the checksums file and find the line for our asset.
-    let sums = ureq::get(&format!("{base}/SHA256SUMS"))
-        .set("User-Agent", &ua)
-        .timeout(std::time::Duration::from_secs(30))
+    let agent = http_agent();
+    let sums = agent
+        .get(format!("{base}/SHA256SUMS"))
+        .header("User-Agent", &ua)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build()
         .call();
-    let sums = match sums {
-        Ok(r) => r.into_string()?,
-        Err(e) => bail!("fetching SHA256SUMS: {e}"),
-    };
+    let sums = check(sums)
+        .and_then(|mut r| Ok(r.body_mut().read_to_string()?))
+        .context("fetching SHA256SUMS")?;
     let want = checksum_for(&sums, asset)
         .with_context(|| format!("no checksum for {asset} in SHA256SUMS"))?;
 
     // Download the binary into memory and verify before touching disk.
     eprintln!("downloading {asset} {latest}...");
     let bytes = {
-        let res = ureq::get(&format!("{base}/{asset}"))
-            .set("User-Agent", &ua)
-            .timeout(std::time::Duration::from_secs(120))
+        let res = agent
+            .get(format!("{base}/{asset}"))
+            .header("User-Agent", &ua)
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(120)))
+            .build()
             .call();
-        match res {
-            Ok(r) => {
-                let mut buf = Vec::new();
-                r.into_reader().read_to_end(&mut buf)?;
-                buf
-            }
-            Err(e) => bail!("downloading {asset}: {e}"),
-        }
+        let mut buf = Vec::new();
+        check(res)
+            .and_then(|r| Ok(r.into_body().into_reader().read_to_end(&mut buf)?))
+            .with_context(|| format!("downloading {asset}"))?;
+        buf
     };
 
     use sha2::{Digest, Sha256};
@@ -2046,13 +2146,13 @@ fn run() -> Result<()> {
             } else {
                 ISSUE_FIELDS
             };
-            let i = c.get(&format!("issues/{id}"), &[("fields", fields)])?;
+            let i = c.get(&format!("issues/{}", seg(&id)), &[("fields", fields)])?;
             if json {
                 let rid = i["idReadable"].as_str().unwrap_or(&id).to_string();
                 let links = fetch_links(&c, &rid, LINK_FIELDS_JSON)?;
                 let cm = if comments {
                     Some(c.get_all(
-                        &format!("issues/{rid}/comments"),
+                        &format!("issues/{}/comments", seg(&rid)),
                         &[("fields", COMMENT_FIELDS_JSON)],
                     )?)
                 } else {
@@ -2175,7 +2275,11 @@ fn run() -> Result<()> {
             if let Some(d) = desc {
                 body["description"] = json!(d);
             }
-            c.post(&format!("issues/{id}"), &[("fields", "idReadable")], body)?;
+            c.post(
+                &format!("issues/{}", seg(&id)),
+                &[("fields", "idReadable")],
+                body,
+            )?;
             println!("{id}");
         }
         Cmd::Write {
@@ -2202,7 +2306,7 @@ fn run() -> Result<()> {
             if public || !group.is_empty() || !user.is_empty() {
                 body["visibility"] = resolve_visibility(&c, public, &group, &user)?;
             }
-            c.post(&format!("issues/{id}/comments"), &[], body)?;
+            c.post(&format!("issues/{}/comments", seg(&id)), &[], body)?;
             println!("ok");
         }
         Cmd::Write {
@@ -2224,7 +2328,7 @@ fn run() -> Result<()> {
                 bail!("empty comment");
             }
             c.post(
-                &format!("issues/{issue}/comments/{comment_id}"),
+                &format!("issues/{}/comments/{}", seg(&issue), seg(&comment_id)),
                 &[("fields", "id")],
                 json!({ "text": text }),
             )?;
@@ -2241,7 +2345,7 @@ fn run() -> Result<()> {
                         },
                 },
         } => {
-            let path = format!("issues/{issue}/comments/{comment_id}");
+            let path = format!("issues/{}/comments/{}", seg(&issue), seg(&comment_id));
             c.post(&path, &[("fields", "id")], json!({ "deleted": true }))?;
             if permanent {
                 c.delete(&path).context(
@@ -2267,12 +2371,12 @@ fn run() -> Result<()> {
         } => {
             let vis = resolve_visibility(&c, public, &group, &user)?;
             c.post(
-                &format!("issues/{issue}/comments/{comment_id}"),
+                &format!("issues/{}/comments/{}", seg(&issue), seg(&comment_id)),
                 &[("fields", "id")],
                 json!({"visibility": vis}),
             )?;
             let cm = c.get(
-                &format!("issues/{issue}/comments/{comment_id}"),
+                &format!("issues/{}/comments/{}", seg(&issue), seg(&comment_id)),
                 &[("fields", COMMENT_FIELDS)],
             )?;
             let marker = visibility_marker(&cm["visibility"]);
@@ -2290,7 +2394,7 @@ fn run() -> Result<()> {
         } => {
             if json {
                 let comments = c.get_all(
-                    &format!("issues/{id}/comments"),
+                    &format!("issues/{}/comments", seg(&id)),
                     &[("fields", COMMENT_FIELDS_JSON)],
                 )?;
                 print_json(&comments)?;
@@ -2306,7 +2410,7 @@ fn run() -> Result<()> {
         } => {
             if json {
                 let links = c.get_all(
-                    &format!("issues/{id}/links"),
+                    &format!("issues/{}/links", seg(&id)),
                     &[("fields", LINK_FIELDS_JSON)],
                 )?;
                 print_json(&links)?;
@@ -2322,7 +2426,7 @@ fn run() -> Result<()> {
         } => {
             let group = resolve_link_group(&c, &id, &phrase)?;
             c.post(
-                &format!("issues/{id}/links/{group}/issues"),
+                &format!("issues/{}/links/{}/issues", seg(&id), seg(&group)),
                 &[("fields", "idReadable")],
                 json!({"idReadable": target}),
             )?;
@@ -2336,7 +2440,12 @@ fn run() -> Result<()> {
         } => {
             let group = resolve_link_group(&c, &id, &phrase)?;
             let tid = internal_id(&c, &target)?;
-            c.delete(&format!("issues/{id}/links/{group}/issues/{tid}"))?;
+            c.delete(&format!(
+                "issues/{}/links/{}/issues/{}",
+                seg(&id),
+                seg(&group),
+                seg(&tid)
+            ))?;
             println!("{id} unlinked {target}");
         }
         Cmd::Read {
@@ -2351,7 +2460,10 @@ fn run() -> Result<()> {
             } else {
                 "id,name,size,url"
             };
-            let atts = c.get_all(&format!("issues/{id}/attachments"), &[("fields", fields)])?;
+            let atts = c.get_all(
+                &format!("issues/{}/attachments", seg(&id)),
+                &[("fields", fields)],
+            )?;
             if json {
                 print_json(&atts)?;
                 return Ok(());
@@ -2400,8 +2512,8 @@ fn run() -> Result<()> {
                 },
         } => {
             let path = match &comment {
-                Some(cid) => format!("issues/{id}/comments/{cid}/attachments"),
-                None => format!("issues/{id}/attachments"),
+                Some(cid) => format!("issues/{}/comments/{}/attachments", seg(&id), seg(cid)),
+                None => format!("issues/{}/attachments", seg(&id)),
             };
             for f in &files {
                 let a = c.post_file(&path, &[("fields", "id,name")], f)?;
@@ -2456,7 +2568,11 @@ fn run() -> Result<()> {
                 },
         } => {
             let tid = resolve_tag(&c, &tag)?;
-            c.post(&format!("issues/{id}/tags"), &[], json!({"id": tid}))?;
+            c.post(
+                &format!("issues/{}/tags", seg(&id)),
+                &[],
+                json!({"id": tid}),
+            )?;
             println!("ok");
         }
         Cmd::Write {
@@ -2466,7 +2582,7 @@ fn run() -> Result<()> {
                 },
         } => {
             let tid = resolve_tag(&c, &tag)?;
-            c.delete(&format!("issues/{id}/tags/{tid}"))?;
+            c.delete(&format!("issues/{}/tags/{}", seg(&id), seg(&tid)))?;
             println!("ok");
         }
         Cmd::Read {
@@ -2530,7 +2646,7 @@ fn run() -> Result<()> {
                 "canBeEmpty,field(name,fieldType(valueType)),bundle(values(name,archived))"
             };
             let fields = c.get_all(
-                &format!("admin/projects/{pid}/customFields"),
+                &format!("admin/projects/{}/customFields", seg(&pid)),
                 &[("fields", field_spec)],
             )?;
             if json {
@@ -2688,7 +2804,10 @@ fn run() -> Result<()> {
                     cmd: ReadIssueCmd::Open { id, print_only },
                 },
         } => {
-            let i = c.get(&format!("issues/{id}"), &[("fields", "idReadable,summary")])?;
+            let i = c.get(
+                &format!("issues/{}", seg(&id)),
+                &[("fields", "idReadable,summary")],
+            )?;
             let rid = i["idReadable"].as_str().unwrap_or(&id);
             let summary = i["summary"].as_str().unwrap_or("");
             let url = c.web_url(rid);
@@ -3533,50 +3652,121 @@ mod tests {
         assert_ne!(state_style("Open"), state_style("In Progress"));
     }
 
-    fn test_client(silent: bool) -> Client {
-        Client {
-            base: "https://yt.example.com/api".into(),
-            token: "t".into(),
-            silent,
+    #[test]
+    fn seg_leaves_valid_ids_unchanged() {
+        for id in ["DEMO-1", "0-12", "4-567", "a_b.c~Z9"] {
+            assert_eq!(seg(id), id);
         }
     }
 
-    fn has_mute(req: &ureq::Request) -> bool {
-        req.request_url()
-            .unwrap()
-            .query_pairs()
+    #[test]
+    fn seg_encodes_path_breaking_characters() {
+        assert_eq!(seg("DEMO-1/comments"), "DEMO-1%2Fcomments");
+        assert_eq!(seg("DEMO-1?x=1"), "DEMO-1%3Fx%3D1");
+        assert_eq!(seg("DEMO-1#frag"), "DEMO-1%23frag");
+        assert_eq!(seg("a b"), "a%20b");
+        assert_eq!(seg("../x"), "..%2Fx");
+        assert_eq!(seg("é"), "%C3%A9");
+        assert_eq!(seg(""), "");
+    }
+
+    #[test]
+    fn web_url_encodes_id() {
+        let c = test_client(false);
+        assert_eq!(c.web_url("DEMO-1"), "https://yt.example.com/issue/DEMO-1");
+        assert_eq!(
+            c.web_url("DEMO-1/x"),
+            "https://yt.example.com/issue/DEMO-1%2Fx"
+        );
+    }
+
+    #[test]
+    fn half_env_warning_names_missing_var() {
+        assert_eq!(half_env_warning(true, true), None);
+        assert_eq!(half_env_warning(false, false), None);
+        let w = half_env_warning(true, false).unwrap();
+        assert!(
+            w.starts_with("warning: YOUTRACK_API_TOKEN is not set"),
+            "{w}"
+        );
+        assert!(!w.contains('\n'));
+        let w = half_env_warning(false, true).unwrap();
+        assert!(w.starts_with("warning: YOUTRACK_URL is not set"), "{w}");
+    }
+
+    fn test_client(silent: bool) -> Client {
+        Client::new("https://yt.example.com".into(), "t".into(), silent)
+    }
+
+    fn has_mute(params: &[(&str, &str)]) -> bool {
+        params
             .iter()
             .any(|(k, v)| *k == "muteUpdateNotifications" && *v == "true")
     }
 
     #[test]
     fn silent_adds_param_to_mutating_requests() {
-        let c = test_client(true);
-        assert!(has_mute(&c.req("POST", "issues/DEMO-1/comments", &[])));
-        assert!(has_mute(&c.req("PUT", "issues/DEMO-1", &[])));
-        assert!(has_mute(&c.req("DELETE", "issues/DEMO-1/tags/1", &[])));
+        assert!(has_mute(&query_params(true, "POST", &[])));
+        assert!(has_mute(&query_params(true, "PUT", &[])));
+        assert!(has_mute(&query_params(true, "DELETE", &[])));
         // existing params are preserved alongside the mute param
-        let req = c.req("POST", "issues", &[("fields", "idReadable")]);
-        assert!(has_mute(&req));
-        let url = req.request_url().unwrap();
-        assert!(url
-            .query_pairs()
-            .iter()
-            .any(|(k, v)| *k == "fields" && *v == "idReadable"));
+        let p = query_params(true, "POST", &[("fields", "idReadable")]);
+        assert!(has_mute(&p));
+        assert!(p.contains(&("fields", "idReadable")));
+    }
+
+    #[test]
+    fn client_url_joins_base_and_path() {
+        let c = test_client(false);
+        assert_eq!(c.base, "https://yt.example.com/api");
+        assert_eq!(
+            c.url(&format!("issues/{}/comments", seg("DEMO-1"))),
+            "https://yt.example.com/api/issues/DEMO-1/comments"
+        );
+        assert_eq!(
+            c.url(&format!("issues/{}", seg("DEMO-1/comments"))),
+            "https://yt.example.com/api/issues/DEMO-1%2Fcomments"
+        );
+    }
+
+    #[test]
+    fn http_agent_keeps_v2_behaviour() {
+        let cfg = http_agent().config().clone();
+        assert!(!cfg.http_status_as_error());
+        assert!(cfg.proxy().is_none());
+        assert_eq!(cfg.max_redirects(), 5);
+        assert_eq!(
+            cfg.timeouts().connect,
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn http_error_message_prefers_server_description() {
+        assert_eq!(
+            http_error_message(r#"{"error":"x","error_description":"Issue not found"}"#),
+            "Issue not found"
+        );
+        assert_eq!(http_error_message(r#"{"error":"bad"}"#), "bad");
+        assert_eq!(http_error_message("plain text"), "plain text");
+        assert_eq!(http_error_message(""), "");
     }
 
     #[test]
     fn silent_off_omits_param() {
-        let c = test_client(false);
-        assert!(!has_mute(&c.req("POST", "issues/DEMO-1/comments", &[])));
-        assert!(!has_mute(&c.req("DELETE", "issues/DEMO-1/tags/1", &[])));
+        assert!(!has_mute(&query_params(false, "POST", &[])));
+        assert!(!has_mute(&query_params(false, "DELETE", &[])));
+        assert_eq!(
+            query_params(false, "POST", &[("fields", "id")]),
+            vec![("fields", "id")]
+        );
     }
 
     #[test]
     fn silent_never_touches_read_requests() {
         // GET is a read even under silent mode
-        assert!(!has_mute(&test_client(true).req("GET", "issues", &[])));
-        assert!(!has_mute(&test_client(false).req("GET", "issues", &[])));
+        assert!(!has_mute(&query_params(true, "GET", &[])));
+        assert!(!has_mute(&query_params(false, "GET", &[])));
     }
 
     // ---- compact output formatting helpers ----
