@@ -1,12 +1,12 @@
 [package]
 name = "yt"
-version = "0.15.1"
+version = "0.15.2"
 edition = "2021"
 description = "Token-frugal YouTrack CLI for coding agents"
 license = "MIT"
 
 [dependencies]
-anstream = "0.6"
+anstream = "1"
 anstyle = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "color"] }
