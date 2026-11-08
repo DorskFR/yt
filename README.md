@@ -6,7 +6,7 @@ YouTrack CLI for coding agents: one line per issue on reads, only the ID on writ
 [![CI](https://github.com/DorskFR/yt/actions/workflows/ci.yml/badge.svg)](https://github.com/DorskFR/yt/actions/workflows/ci.yml)
 [![license](https://img.shields.io/github/license/DorskFR/yt)](LICENSE)
 
-![yt listing, showing, creating and commenting on issues in a demo project](docs/assets/demo.gif)
+![yt listing, showing, creating and commenting on issues in the DEMO project](docs/assets/demo.gif)
 
 Requests only the fields it prints: a 20-issue search returns about 2 KB instead of about 47 KB of API JSON. Commands split into `yt read` and `yt write`, so an access guard can allow or block each tier by prefix.
 
@@ -77,8 +77,6 @@ Credentials are stored in `~/.config/yt/config.json` (mode 600), keyed by server
 git clone https://github.com/DorskFR/yt && cd yt
 cargo test
 ```
-
-The demo runs against a local mock server ([docs/demo/mock_youtrack.py](docs/demo/mock_youtrack.py)); render steps are in [docs/demo.tape](docs/demo.tape).
 
 ## License
 
