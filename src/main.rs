@@ -4426,17 +4426,17 @@ mod tests {
     }
 
     #[test]
-    fn readme_documents_every_subcommand() {
+    fn reference_documents_every_subcommand() {
         let cmd = Cli::command();
         let mut paths = Vec::new();
         subcommand_paths(&cmd, &[], &mut paths);
-        let readme = include_str!("../README.md");
+        let reference = include_str!("../docs/reference.md");
         let missing: Vec<String> = paths
             .iter()
             .filter(|p| p.last().map(|s| s.as_str()) != Some("help"))
             .map(|p| format!("yt {}", p.join(" ")))
-            .filter(|s| !readme.contains(s.as_str()))
+            .filter(|s| !reference.contains(s.as_str()))
             .collect();
-        assert!(missing.is_empty(), "README.md lacks: {missing:?}");
+        assert!(missing.is_empty(), "docs/reference.md lacks: {missing:?}");
     }
 }
