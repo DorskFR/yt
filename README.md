@@ -67,7 +67,7 @@ Credentials are stored in `~/.config/yt/config.json` (mode 600), keyed by server
 
 - No Windows binary.
 - Project custom fields cannot be created or attached (admin-only API, not implemented).
-- `yt write project create` needs an admin token.
+- `yt write project create` and `edit` need an admin token.
 - `--silent` takes effect only with the *Apply Commands Silently* permission.
 - `comment-delete --permanent` needs the *Delete Comment permanently* permission; without it the comment is only trashed.
 
