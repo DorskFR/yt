@@ -225,7 +225,7 @@ enum WriteCmd {
         #[command(subcommand)]
         cmd: WriteIssueCmd,
     },
-    /// Mutate projects (create)
+    /// Mutate projects (create, edit)
     Project {
         #[command(subcommand)]
         cmd: WriteProjectCmd,
@@ -386,6 +386,23 @@ enum WriteProjectCmd {
         short: String,
         /// Full project name
         name: String,
+    },
+    /// Edit a project (requires an admin token); prints SHORT  NAME
+    Edit {
+        /// Project short name or name, e.g. DEMO
+        project: String,
+        /// New full name
+        #[arg(long)]
+        name: Option<String>,
+        /// New description
+        #[arg(long)]
+        description: Option<String>,
+        /// New leader login
+        #[arg(long)]
+        leader: Option<String>,
+        /// Archive (true) or unarchive (false)
+        #[arg(long)]
+        archived: Option<bool>,
     },
 }
 
@@ -1206,6 +1223,36 @@ fn visible_projects(projects: &Value, all: bool) -> Vec<Value> {
         .filter(|p| all || p["archived"].as_bool() != Some(true))
         .cloned()
         .collect()
+}
+
+fn project_edit_body(
+    name: Option<&str>,
+    description: Option<&str>,
+    leader_id: Option<&str>,
+    archived: Option<bool>,
+) -> Option<Value> {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = name {
+        body.insert("name".into(), json!(v));
+    }
+    if let Some(v) = description {
+        body.insert("description".into(), json!(v));
+    }
+    if let Some(v) = leader_id {
+        body.insert("leader".into(), json!({"id": v}));
+    }
+    if let Some(v) = archived {
+        body.insert("archived".into(), json!(v));
+    }
+    (!body.is_empty()).then_some(Value::Object(body))
+}
+
+fn project_line(p: &Value) -> String {
+    format!(
+        "{}  {}",
+        p["shortName"].as_str().unwrap_or("?"),
+        p["name"].as_str().unwrap_or("")
+    )
 }
 
 fn stdin_text() -> Result<String> {
@@ -2603,12 +2650,41 @@ fn run() -> Result<()> {
                 return Ok(());
             }
             for p in &list {
-                println!(
-                    "{}  {}",
-                    p["shortName"].as_str().unwrap_or("?"),
-                    p["name"].as_str().unwrap_or("")
-                );
+                println!("{}", project_line(p));
             }
+        }
+        Cmd::Write {
+            cmd:
+                WriteCmd::Project {
+                    cmd:
+                        WriteProjectCmd::Edit {
+                            project,
+                            name,
+                            description,
+                            leader,
+                            archived,
+                        },
+                },
+        } => {
+            if name.is_none() && description.is_none() && leader.is_none() && archived.is_none() {
+                eprintln!("nothing to change: pass --name, --description, --leader or --archived");
+                return Ok(());
+            }
+            let (pid, _) = resolve_project(&c, &project)?;
+            let leader_id = leader.as_deref().map(|l| resolve_user(&c, l)).transpose()?;
+            let body = project_edit_body(
+                name.as_deref(),
+                description.as_deref(),
+                leader_id.as_deref(),
+                archived,
+            )
+            .context("nothing to change")?;
+            let updated = c.post(
+                &format!("admin/projects/{}", seg(&pid)),
+                &[("fields", "shortName,name")],
+                body,
+            )?;
+            println!("{}", project_line(&updated));
         }
         Cmd::Write {
             cmd:
@@ -3069,6 +3145,66 @@ mod tests {
         assert_eq!(names(false), ["A", "C"]);
         assert_eq!(names(true), ["A", "B", "C"]);
         assert!(visible_projects(&json!(null), true).is_empty());
+    }
+
+    #[test]
+    fn project_edit_body_sets_only_given_fields() {
+        assert_eq!(project_edit_body(None, None, None, None), None);
+        assert_eq!(
+            project_edit_body(Some("Demo App"), None, None, None),
+            Some(json!({"name": "Demo App"}))
+        );
+        assert_eq!(
+            project_edit_body(Some("N"), Some("D"), Some("1-2"), Some(false)),
+            Some(
+                json!({"name": "N", "description": "D", "leader": {"id": "1-2"}, "archived": false})
+            )
+        );
+        assert_eq!(
+            project_edit_body(None, Some(""), None, Some(true)),
+            Some(json!({"description": "", "archived": true}))
+        );
+    }
+
+    #[test]
+    fn project_line_prints_short_and_name() {
+        assert_eq!(
+            project_line(&json!({"shortName": "DEMO", "name": "Demo App"})),
+            "DEMO  Demo App"
+        );
+        assert_eq!(project_line(&json!({})), "?  ");
+    }
+
+    #[test]
+    fn project_edit_flags() {
+        assert!(Cli::try_parse_from(["yt", "write", "project", "edit", "DEMO"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "yt",
+            "write",
+            "project",
+            "edit",
+            "DEMO",
+            "--name",
+            "N",
+            "--description",
+            "D",
+            "--leader",
+            "alice",
+            "--archived",
+            "true"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "yt",
+            "write",
+            "project",
+            "edit",
+            "DEMO",
+            "--archived",
+            "yes"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["yt", "write", "project", "edit"]).is_err());
     }
 
     #[test]

@@ -46,6 +46,8 @@ yt write issue cmd "COMMAND" ID... [-m COMMENT]  apply command: state, assignee,
 yt write issue tag ID TAG                   add a tag (by name) to an issue
 yt write issue untag ID TAG                 remove a tag (by name) from an issue
 yt write project create SHORT NAME          create a project (prints SHORT  ID); needs an admin token
+yt write project edit PROJECT [--name N] [--description D] [--leader LOGIN] [--archived true|false]
+                                            edit a project (prints SHORT  NAME); needs an admin token
 yt write server auth URL TOKEN [NAME]       save credentials (NAME defaults to "default")
 yt write server default NAME                set the default server
 yt write update [--force]                   self-update to the latest release
@@ -97,7 +99,7 @@ Output goes through [`anstream`](https://docs.rs/anstream): colour is off when s
 
 ## Projects
 
-`yt write project create` POSTs to `/api/admin/projects` and needs a token with admin permissions; a non-admin token returns `HTTP 403` with the server's message. The current user becomes project leader. Creating or attaching project custom fields is also admin-only and is not implemented.
+`yt write project create` POSTs to `/api/admin/projects` and needs a token with admin permissions; a non-admin token returns `HTTP 403` with the server's message. The current user becomes project leader. `yt write project edit` POSTs only the given fields to `/api/admin/projects/{id}`; with no flag it changes nothing and makes no request. Creating or attaching project custom fields is also admin-only and is not implemented.
 
 ## Shell completions
 
