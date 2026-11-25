@@ -432,12 +432,21 @@ fn config_path() -> std::path::PathBuf {
         .join("yt/config.json")
 }
 
-/// On-disk config: {"default": "<name>", "servers": {"<name>": {"url","token"}}}.
+/// Paths to a PEM client certificate chain and its private key.
+#[derive(Default, Clone, Debug, PartialEq)]
+struct CertPaths {
+    cert: Option<String>,
+    key: Option<String>,
+}
+
+/// On-disk config: {"default": "<name>", "servers": {"<name>": {"url","token",
+/// "client_cert"?, "client_key"?}}}.
 /// Transparently migrates the legacy {"url","token"} single-server shape.
 #[derive(Default)]
 struct Config {
     default: Option<String>,
     servers: std::collections::BTreeMap<String, (String, String)>,
+    certs: std::collections::BTreeMap<String, CertPaths>,
 }
 
 impl Config {
@@ -460,10 +469,18 @@ impl Config {
     /// legacy single-server `{"url","token"}` layout. Pure: no IO.
     fn from_value(cfg: &Value) -> Self {
         let mut servers = std::collections::BTreeMap::new();
+        let mut certs = std::collections::BTreeMap::new();
         if let Some(obj) = cfg["servers"].as_object() {
             for (name, v) in obj {
                 if let (Some(u), Some(t)) = (v["url"].as_str(), v["token"].as_str()) {
                     servers.insert(name.clone(), (u.to_string(), t.to_string()));
+                    let paths = CertPaths {
+                        cert: v["client_cert"].as_str().map(String::from),
+                        key: v["client_key"].as_str().map(String::from),
+                    };
+                    if paths != CertPaths::default() {
+                        certs.insert(name.clone(), paths);
+                    }
                 }
             }
         } else if let (Some(u), Some(t)) = (cfg["url"].as_str(), cfg["token"].as_str()) {
@@ -471,7 +488,11 @@ impl Config {
             servers.insert("default".into(), (u.to_string(), t.to_string()));
         }
         let default = cfg["default"].as_str().map(String::from);
-        Self { default, servers }
+        Self {
+            default,
+            servers,
+            certs,
+        }
     }
 
     /// Pick a server name given an explicit `--server`, falling back to the
@@ -503,7 +524,18 @@ impl Config {
         let servers: serde_json::Map<String, Value> = self
             .servers
             .iter()
-            .map(|(name, (u, t))| (name.clone(), json!({"url": u, "token": t})))
+            .map(|(name, (u, t))| {
+                let mut v = json!({"url": u, "token": t});
+                if let Some(p) = self.certs.get(name) {
+                    if let Some(c) = &p.cert {
+                        v["client_cert"] = json!(c);
+                    }
+                    if let Some(k) = &p.key {
+                        v["client_key"] = json!(k);
+                    }
+                }
+                (name.clone(), v)
+            })
             .collect();
         let cfg = json!({"default": self.default, "servers": servers});
         let tmp = path.with_extension("json.tmp");
@@ -559,10 +591,89 @@ struct Client {
     agent: ureq::Agent,
 }
 
-/// One HTTP agent for the process. HTTP error statuses are returned as
-/// responses so the server's error body can be reported; proxies are not
-/// read from the environment.
-fn http_agent() -> ureq::Agent {
+/// The client certificate and key paths to use: each env var wins over the
+/// server's config entry; empty env values count as unset. Both or neither
+/// must end up set. Pure.
+fn client_cert_paths(
+    env_cert: Option<String>,
+    env_key: Option<String>,
+    cfg: Option<&CertPaths>,
+) -> Result<Option<(String, String)>> {
+    let env_cert = env_cert.filter(|s| !s.is_empty());
+    let env_key = env_key.filter(|s| !s.is_empty());
+    let cert = env_cert.or_else(|| cfg.and_then(|p| p.cert.clone()));
+    let key = env_key.or_else(|| cfg.and_then(|p| p.key.clone()));
+    match (cert, key) {
+        (Some(c), Some(k)) => Ok(Some((c, k))),
+        (None, None) => Ok(None),
+        (Some(_), None) => {
+            bail!("a client certificate is set without a key: set client_key or YT_CLIENT_KEY")
+        }
+        (None, Some(_)) => {
+            bail!("a client key is set without a certificate: set client_cert or YT_CLIENT_CERT")
+        }
+    }
+}
+
+/// Load a PEM certificate chain and the first PEM private key into a client
+/// identity, naming the offending file on any failure.
+fn load_client_cert(cert_path: &str, key_path: &str) -> Result<ureq::tls::ClientCert> {
+    use ureq::tls::PemItem;
+    let read = |path: &str, what: &str| {
+        std::fs::read(path).with_context(|| format!("reading client {what} {path}"))
+    };
+    let cert_pem = read(cert_path, "certificate")?;
+    let mut chain = Vec::new();
+    for item in ureq::tls::parse_pem(&cert_pem) {
+        if let PemItem::Certificate(c) =
+            item.with_context(|| format!("invalid PEM in client certificate {cert_path}"))?
+        {
+            chain.push(c);
+        }
+    }
+    if chain.is_empty() {
+        bail!("no certificate found in client certificate {cert_path}");
+    }
+    let key_pem = read(key_path, "key")?;
+    let mut key = None;
+    for item in ureq::tls::parse_pem(&key_pem) {
+        if let PemItem::PrivateKey(k) =
+            item.with_context(|| format!("invalid PEM in client key {key_path}"))?
+        {
+            key = Some(k);
+            break;
+        }
+    }
+    let key = key.with_context(|| format!("no private key found in client key {key_path}"))?;
+    Ok(ureq::tls::ClientCert::new_with_certs(&chain, key))
+}
+
+/// A hint for a transport error that is a TLS alert about the client
+/// certificate. Pure.
+fn tls_hint(err: &str) -> Option<&'static str> {
+    if err.contains("CertificateRequired") || err.contains("certificate required") {
+        Some("hint: the server requires a TLS client certificate: set client_cert and client_key for this server in config.json, or YT_CLIENT_CERT and YT_CLIENT_KEY")
+    } else if [
+        "BadCertificate",
+        "UnknownCA",
+        "CertificateUnknown",
+        "CertificateExpired",
+        "CertificateRevoked",
+        "UnsupportedCertificate",
+    ]
+    .iter()
+    .any(|a| err.contains(&format!("received fatal alert: {a}")))
+    {
+        Some("hint: the server rejected the TLS client certificate")
+    } else {
+        None
+    }
+}
+
+/// An HTTP agent. HTTP error statuses are returned as responses so the
+/// server's error body can be reported; proxies are not read from the
+/// environment. The client certificate, if any, is presented on request.
+fn http_agent(client_cert: Option<ureq::tls::ClientCert>) -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .proxy(None)
@@ -571,6 +682,7 @@ fn http_agent() -> ureq::Agent {
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .client_cert(client_cert)
                 .build(),
         )
         .build()
@@ -637,27 +749,40 @@ impl Client {
         if let Some(w) = half_env_warning(env_url.is_some(), env_token.is_some()) {
             eprintln!("{w}");
         }
-        let (url, token) = match (env_url, env_token) {
+        let (url, token, cfg_certs) = match (env_url, env_token) {
             // both env vars present (and no explicit --server): use them directly
-            (Some(u), Some(t)) if server.is_none() => (u, t),
+            (Some(u), Some(t)) if server.is_none() => (u, t, None),
             _ => {
                 let cfg = Config::load()?;
                 let name = cfg.select_server(server)?;
                 let (u, t) = cfg.servers.get(&name).with_context(|| {
                     format!("no server named '{name}': run `yt write server auth URL TOKEN {name}`")
                 })?;
-                (u.clone(), t.clone())
+                (u.clone(), t.clone(), cfg.certs.get(&name).cloned())
             }
         };
-        Ok(Self::new(url, token, silent))
+        let client_cert = match client_cert_paths(
+            std::env::var("YT_CLIENT_CERT").ok(),
+            std::env::var("YT_CLIENT_KEY").ok(),
+            cfg_certs.as_ref(),
+        )? {
+            Some((c, k)) => Some(load_client_cert(&c, &k)?),
+            None => None,
+        };
+        Ok(Self::new(url, token, silent, client_cert))
     }
 
-    fn new(url: String, token: String, silent: bool) -> Self {
+    fn new(
+        url: String,
+        token: String,
+        silent: bool,
+        client_cert: Option<ureq::tls::ClientCert>,
+    ) -> Self {
         Self {
             base: normalize_base(&url),
             token,
             silent,
-            agent: http_agent(),
+            agent: http_agent(client_cert),
         }
     }
 
@@ -862,7 +987,13 @@ fn http_error_message(body: &str) -> String {
 fn check(res: Result<HttpResponse, ureq::Error>) -> Result<HttpResponse> {
     let mut r = match res {
         Ok(r) => r,
-        Err(e) => bail!(e.to_string()),
+        Err(e) => {
+            let msg = e.to_string();
+            match tls_hint(&msg) {
+                Some(h) => bail!("{msg}\n{h}"),
+                None => bail!(msg),
+            }
+        }
     };
     let code = r.status().as_u16();
     if code >= 400 {
@@ -1851,7 +1982,7 @@ fn newest_semver_tag(releases: &Value) -> Option<(String, String)> {
 /// Time-boxed; any failure is an error the caller can swallow.
 fn fetch_latest_release() -> Result<(String, String)> {
     let url = format!("https://api.github.com/repos/{REPO}/releases?per_page=20");
-    let res = http_agent()
+    let res = http_agent(None)
         .get(&url)
         .header("User-Agent", format!("yt/{}", env!("CARGO_PKG_VERSION")))
         .header("Accept", "application/vnd.github+json")
@@ -1931,7 +2062,7 @@ fn self_update(force: bool) -> Result<()> {
     let ua = format!("yt/{current}");
 
     // Fetch the checksums file and find the line for our asset.
-    let agent = http_agent();
+    let agent = http_agent(None);
     let sums = agent
         .get(format!("{base}/SHA256SUMS"))
         .header("User-Agent", &ua)
@@ -3571,6 +3702,7 @@ mod tests {
         Config {
             default: default.map(String::from),
             servers,
+            ..Default::default()
         }
     }
 
@@ -3831,7 +3963,7 @@ mod tests {
     }
 
     fn test_client(silent: bool) -> Client {
-        Client::new("https://yt.example.com".into(), "t".into(), silent)
+        Client::new("https://yt.example.com".into(), "t".into(), silent, None)
     }
 
     fn has_mute(params: &[(&str, &str)]) -> bool {
@@ -3867,7 +3999,7 @@ mod tests {
 
     #[test]
     fn http_agent_keeps_v2_behaviour() {
-        let cfg = http_agent().config().clone();
+        let cfg = http_agent(None).config().clone();
         assert!(!cfg.http_status_as_error());
         assert!(cfg.proxy().is_none());
         assert_eq!(cfg.max_redirects(), 5);
@@ -4255,6 +4387,174 @@ mod tests {
         d
     }
 
+    // ---- client certificates (mTLS) ----
+
+    fn paths(cert: Option<&str>, key: Option<&str>) -> CertPaths {
+        CertPaths {
+            cert: cert.map(String::from),
+            key: key.map(String::from),
+        }
+    }
+
+    #[test]
+    fn client_cert_paths_from_config() {
+        let p = paths(Some("/c.pem"), Some("/k.pem"));
+        assert_eq!(
+            client_cert_paths(None, None, Some(&p)).unwrap(),
+            Some(("/c.pem".into(), "/k.pem".into()))
+        );
+        assert_eq!(client_cert_paths(None, None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn client_cert_paths_env_wins_per_field() {
+        let p = paths(Some("/c.pem"), Some("/k.pem"));
+        assert_eq!(
+            client_cert_paths(Some("/env-c.pem".into()), None, Some(&p)).unwrap(),
+            Some(("/env-c.pem".into(), "/k.pem".into()))
+        );
+        assert_eq!(
+            client_cert_paths(Some("/ec".into()), Some("/ek".into()), Some(&p)).unwrap(),
+            Some(("/ec".into(), "/ek".into()))
+        );
+        assert_eq!(
+            client_cert_paths(Some("/ec".into()), Some("/ek".into()), None).unwrap(),
+            Some(("/ec".into(), "/ek".into()))
+        );
+    }
+
+    #[test]
+    fn client_cert_paths_empty_env_is_unset() {
+        let p = paths(Some("/c.pem"), Some("/k.pem"));
+        assert_eq!(
+            client_cert_paths(Some(String::new()), Some(String::new()), Some(&p)).unwrap(),
+            Some(("/c.pem".into(), "/k.pem".into()))
+        );
+    }
+
+    #[test]
+    fn client_cert_paths_half_set_errors() {
+        let e = client_cert_paths(Some("/c".into()), None, None).unwrap_err();
+        assert!(e.to_string().contains("YT_CLIENT_KEY"), "{e}");
+        let e = client_cert_paths(None, None, Some(&paths(None, Some("/k")))).unwrap_err();
+        assert!(e.to_string().contains("YT_CLIENT_CERT"), "{e}");
+    }
+
+    #[test]
+    fn config_reads_and_saves_client_cert_keys() {
+        let cfg = Config::from_value(&json!({
+            "default": "home",
+            "servers": {
+                "home": {"url": "https://h", "token": "t",
+                         "client_cert": "/c.pem", "client_key": "/k.pem"},
+                "work": {"url": "https://w", "token": "u"}
+            }
+        }));
+        assert_eq!(
+            cfg.certs.get("home"),
+            Some(&paths(Some("/c.pem"), Some("/k.pem")))
+        );
+        assert!(!cfg.certs.contains_key("work"));
+        let d = scratch_dir("cfg-certs");
+        let path = d.join("yt/config.json");
+        cfg.save_to(&path).unwrap();
+        let back = Config::load_from(&path).unwrap();
+        assert_eq!(back.certs, cfg.certs);
+        assert_eq!(back.servers, cfg.servers);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    const FAKE_CERT: &str = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    const FAKE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+
+    fn pem_files(tag: &str, cert: &str, key: &str) -> (std::path::PathBuf, String, String) {
+        let d = scratch_dir(tag);
+        let (c, k) = (d.join("c.pem"), d.join("k.pem"));
+        std::fs::write(&c, cert).unwrap();
+        std::fs::write(&k, key).unwrap();
+        let s = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+        (d, s(c), s(k))
+    }
+
+    #[test]
+    fn load_client_cert_reads_chain_and_key() {
+        let (d, c, k) = pem_files("pem-ok", &format!("{FAKE_CERT}{FAKE_CERT}"), FAKE_KEY);
+        let cc = load_client_cert(&c, &k).unwrap();
+        assert_eq!(cc.certs().len(), 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn load_client_cert_missing_files_name_the_path() {
+        let (d, c, k) = pem_files("pem-missing", FAKE_CERT, FAKE_KEY);
+        let e = format!(
+            "{:#}",
+            load_client_cert("/nonexistent/c.pem", &k).unwrap_err()
+        );
+        assert!(
+            e.starts_with("reading client certificate /nonexistent/c.pem"),
+            "{e}"
+        );
+        let e = format!(
+            "{:#}",
+            load_client_cert(&c, "/nonexistent/k.pem").unwrap_err()
+        );
+        assert!(
+            e.starts_with("reading client key /nonexistent/k.pem"),
+            "{e}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn load_client_cert_rejects_wrong_or_empty_pem() {
+        let (d, c, k) = pem_files("pem-wrong", FAKE_KEY, FAKE_CERT);
+        let e = load_client_cert(&c, &k).unwrap_err().to_string();
+        assert!(
+            e.contains("no certificate found in client certificate"),
+            "{e}"
+        );
+        let e = load_client_cert(&k, &k).unwrap_err().to_string();
+        assert!(e.contains("no private key found in client key"), "{e}");
+        std::fs::write(&c, "not pem at all").unwrap();
+        let e = load_client_cert(&c, &k).unwrap_err().to_string();
+        assert!(e.contains("no certificate found"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn load_client_cert_reports_invalid_pem() {
+        let bad = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+        let (d, c, k) = pem_files("pem-invalid", bad, FAKE_KEY);
+        let e = load_client_cert(&c, &k).unwrap_err().to_string();
+        assert!(e.contains("invalid PEM in client certificate"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn tls_hint_on_client_certificate_alerts() {
+        let h = tls_hint("io: received fatal alert: CertificateRequired").unwrap();
+        assert!(h.contains("YT_CLIENT_CERT"), "{h}");
+        let h = tls_hint("rustls: received fatal alert: BadCertificate").unwrap();
+        assert!(h.contains("rejected"), "{h}");
+        assert!(tls_hint("io: invalid peer certificate: UnknownIssuer").is_none());
+        assert!(tls_hint("io: Connection refused (os error 111)").is_none());
+    }
+
+    #[test]
+    fn http_agent_carries_client_cert() {
+        assert!(http_agent(None)
+            .config()
+            .tls_config()
+            .client_cert()
+            .is_none());
+        let (d, c, k) = pem_files("pem-agent", FAKE_CERT, FAKE_KEY);
+        let cc = load_client_cert(&c, &k).unwrap();
+        let a = http_agent(Some(cc));
+        assert!(a.config().tls_config().client_cert().is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn config_load_missing_is_empty_but_unreadable_errors() {
         let d = scratch_dir("cfg-load");
@@ -4275,6 +4575,7 @@ mod tests {
                 ("https://h.example.com".to_string(), "tok".to_string()),
             )]
             .into(),
+            ..Default::default()
         };
         cfg.save_to(&path).unwrap();
         cfg.save_to(&path).unwrap();

@@ -55,11 +55,12 @@ Credentials are stored in `~/.config/yt/config.json` (mode 600), keyed by server
 |---|---|
 | `YOUTRACK_URL` + `YOUTRACK_API_TOKEN` | Override the configured server; used only as a pair |
 | `--server NAME` | Use a named server from the config |
+| `client_cert` + `client_key` / `YT_CLIENT_CERT` + `YT_CLIENT_KEY` | PEM client certificate for mTLS, per server; env wins |
 | `--agent` / `YT_AGENT=1` | No colour, no update notice |
 | `--silent` / `YT_MUTE_NOTIFICATIONS=1` | Mute watcher notifications on writes |
 | `YT_NO_UPDATE_CHECK=1` | Disable the update notice |
 
-- Multiple servers and resolution order: [docs/configuration.md](docs/configuration.md)
+- Multiple servers, client certificates and resolution order: [docs/configuration.md](docs/configuration.md)
 - Every command, JSON output, comments, completions: [docs/reference.md](docs/reference.md) and `yt --help`
 - `CLAUDE.md` snippet for agents: [docs/agent-setup.md](docs/agent-setup.md)
 
