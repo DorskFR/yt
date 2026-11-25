@@ -1,6 +1,6 @@
 [package]
 name = "yt"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 description = "YouTrack CLI for coding agents: one line per issue on reads, only the ID on writes."
 license = "MIT"
