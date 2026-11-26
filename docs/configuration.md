@@ -2,10 +2,11 @@
 
 ## Credentials
 
-`yt write server auth URL TOKEN [NAME]` writes `~/.config/yt/config.json` (or `$XDG_CONFIG_HOME/yt/config.json`) with mode 600. A token of `-` is read from stdin.
+`yt write server auth URL [TOKEN] [NAME]` writes `~/.config/yt/config.json` (or `$XDG_CONFIG_HOME/yt/config.json`) with mode 600. With TOKEN omitted or `-`, the token is read from stdin: a hidden prompt on a terminal, the whole input otherwise. A token typed on the command line still works but lands in shell history and the process list, so `yt` warns on stderr.
 
 ```sh
-yt write server auth https://youtrack.example.com perm-...
+yt write server auth https://youtrack.example.com              # hidden prompt
+printf %s "$TOKEN" | yt write server auth https://youtrack.example.com -
 ```
 
 ## Multiple servers
@@ -13,8 +14,8 @@ yt write server auth https://youtrack.example.com perm-...
 Credentials are keyed by server name. The first server added becomes the default; with no name it is stored as `default`.
 
 ```sh
-yt write server auth https://yt.example.com perm-...        # name "default"
-yt write server auth https://yt.acme.com perm-... acme      # named server
+yt write server auth https://yt.example.com                 # name "default"
+yt write server auth https://yt.acme.com - acme             # named server
 yt read server ls                                           # * marks the default
 yt write server default acme                                # change the default
 yt --server acme read issue ls "project: ACME #Unresolved"  # one-off override

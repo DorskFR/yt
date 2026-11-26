@@ -174,11 +174,11 @@ fn unknown_project_is_a_clear_error() {
 }
 
 #[test]
-fn no_flag_is_a_no_op() {
+fn no_flag_is_a_usage_error() {
     let m = mock();
     let o = yt(&m, &["write", "project", "edit", "DEMO"]);
-    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
     assert_eq!(stdout(&o), "");
-    assert!(stderr(&o).contains("nothing to change"));
+    assert!(stderr(&o).contains("--name"), "{}", stderr(&o));
     assert!(m.log.lock().unwrap().is_empty());
 }
