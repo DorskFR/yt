@@ -1,3 +1,5 @@
+<img src="docs/assets/icon.svg" width="64" height="64" alt="">
+
 # yt
 
 YouTrack CLI for coding agents: one line per issue on reads, only the ID on writes.
