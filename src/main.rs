@@ -30,7 +30,7 @@ const PR_ACTIVITY_FIELDS: &str = "added(state(id),url)";
     about = "Token-frugal YouTrack CLI (env: YOUTRACK_URL, YOUTRACK_API_TOKEN)"
 )]
 struct Cli {
-    /// Use a named server from config (env vars still take precedence)
+    /// Use a named server from config (overrides YOUTRACK_URL/YOUTRACK_API_TOKEN)
     #[arg(long, global = true)]
     server: Option<String>,
     /// Suppress watcher notifications on `yt write issue …` calls by sending
@@ -408,7 +408,7 @@ enum WriteProjectCmd {
 
 #[derive(Subcommand)]
 enum WriteServerCmd {
-    /// Save credentials to ~/.config/yt/config.json (env vars still take precedence)
+    /// Save credentials to ~/.config/yt/config.json (YOUTRACK_URL/YOUTRACK_API_TOKEN win unless --server is given)
     Auth {
         /// YouTrack base URL, e.g. https://youtrack.example.com
         url: String,
@@ -931,22 +931,108 @@ fn unique_file_name(
     if used.insert(name.clone()) {
         return name;
     }
-    let p = std::path::Path::new(&name);
-    let alt = match (
+    let alt = id_suffixed(&name, id);
+    used.insert(alt.clone());
+    alt
+}
+
+fn id_suffixed(name: &str, id: &str) -> String {
+    let p = std::path::Path::new(name);
+    match (
         p.file_stem().and_then(|s| s.to_str()),
         p.extension().and_then(|e| e.to_str()),
     ) {
         (Some(stem), Some(ext)) => format!("{stem}-{id}.{ext}"),
         _ => format!("{name}-{id}"),
+    }
+}
+
+/// Create `name` in `dir` without ever replacing an existing file: if it is
+/// taken, try the id-suffixed form; `None` when both already exist.
+fn create_new_file(
+    dir: &std::path::Path,
+    name: &str,
+    id: &str,
+) -> Result<Option<(std::fs::File, std::path::PathBuf)>> {
+    let alt = id_suffixed(name, id);
+    let candidates = if alt == name {
+        vec![name]
+    } else {
+        vec![name, alt.as_str()]
     };
-    used.insert(alt.clone());
-    alt
+    for n in candidates {
+        let path = dir.join(n);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => return Ok(Some((f, path))),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("cannot create {}", path.display())),
+        }
+    }
+    Ok(None)
+}
+
+fn display_unsafe(c: char) -> bool {
+    (c.is_control() && c != '\n' && c != '\t')
+        || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Make server-sourced text safe to print on a terminal: control characters
+/// (except newline and tab) and bidi overrides become visible `\x..`/`\u{..}`
+/// escapes; a CR that ends a CRLF line is dropped. Pure.
+fn sanitize_display(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(display_unsafe) {
+        return s.into();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' && chars.peek() == Some(&'\n') {
+            continue;
+        }
+        if !display_unsafe(c) {
+            out.push(c);
+        } else if (c as u32) < 0x100 {
+            out.push_str(&format!("\\x{:02x}", c as u32));
+        } else {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        }
+    }
+    out.into()
+}
+
+/// `sanitize_display` applied to every string in a JSON value, for the text
+/// renderers. `--json` output never goes through this.
+fn display_safe(mut v: Value) -> Value {
+    fn walk(v: &mut Value) {
+        match v {
+            Value::String(s) => {
+                if let std::borrow::Cow::Owned(clean) = sanitize_display(s) {
+                    *s = clean;
+                }
+            }
+            Value::Array(a) => a.iter_mut().for_each(walk),
+            Value::Object(o) => o.values_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    walk(&mut v);
+    v
 }
 
 fn safe_file_name(name: &str, fallback: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
-    if base.is_empty() || base == "." || base == ".." || base.chars().any(char::is_control) {
+    if base.is_empty()
+        || base == "."
+        || base == ".."
+        || base.chars().any(|c| c.is_control() || display_unsafe(c))
+    {
         format!("attachment-{fallback}")
+    } else if base.starts_with('.') {
+        format!("_{base}")
     } else {
         base.to_string()
     }
@@ -1426,6 +1512,17 @@ fn issue_cf_entry(name: &str, cf_type: &str, raw: &str) -> Option<Value> {
         return None;
     }
     let multi = cf_type.starts_with("Multi");
+    // Command syntax the native body can't express: braced multi-word values,
+    // keywords such as `Unassigned`, and several values for a multi field.
+    if val.contains(['{', '}'])
+        || val == "-"
+        || ["unassigned", "none", "me"]
+            .iter()
+            .any(|k| val.eq_ignore_ascii_case(k))
+        || (multi && val.contains(char::is_whitespace))
+    {
+        return None;
+    }
     // Bundle/user/owned/version/build/group fields carry an object value; multi
     // variants wrap it in an array. `wrap` applies that shape once we pick the key.
     let wrap = |one: Value| if multi { json!([one]) } else { one };
@@ -1441,11 +1538,7 @@ fn issue_cf_entry(name: &str, cf_type: &str, raw: &str) -> Option<Value> {
         | "SingleGroupIssueCustomField"
         | "MultiGroupIssueCustomField" => wrap(json!({"name": val})),
         "StateIssueCustomField" | "StateMachineIssueCustomField" => json!({"name": val}),
-        "SingleUserIssueCustomField" | "MultiUserIssueCustomField"
-            if !val.eq_ignore_ascii_case("me") =>
-        {
-            wrap(json!({"login": val}))
-        }
+        "SingleUserIssueCustomField" | "MultiUserIssueCustomField" => wrap(json!({"login": val})),
         "TextIssueCustomField" => json!({"text": val}),
         "PeriodIssueCustomField" => json!({"presentation": val}),
         // integer / float / string all use SimpleIssueCustomField; infer the JSON
@@ -1793,7 +1886,7 @@ fn print_comments(c: &Client, id: &str) -> Result<()> {
         &format!("issues/{}/comments", seg(id)),
         &[("fields", COMMENT_FIELDS)],
     )?;
-    let list: Vec<Value> = comments
+    let list: Vec<Value> = display_safe(comments)
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -1857,7 +1950,10 @@ fn print_link_groups(groups: &[Value], t: &Theme) {
 
 /// Print an issue's links, one linked issue per line: `phrase  ID  summary`.
 fn print_links(c: &Client, id: &str) -> Result<()> {
-    let groups = fetch_links(c, id, LINK_FIELDS)?;
+    let groups: Vec<Value> = fetch_links(c, id, LINK_FIELDS)?
+        .into_iter()
+        .map(display_safe)
+        .collect();
     if groups.is_empty() {
         println!("no links");
         return Ok(());
@@ -2291,9 +2387,17 @@ fn run() -> Result<()> {
                 return Ok(());
             }
             if list.is_empty() {
-                println!("no matches");
+                if merged_pr && !fetched.is_empty() {
+                    println!("no matches in this page ({} fetched)", fetched.len());
+                } else {
+                    println!("no matches");
+                }
+                if fetched.len() == limit {
+                    eprintln!("{}", limit_hint(limit, skip));
+                }
                 return Ok(());
             }
+            let list: Vec<Value> = list.into_iter().map(display_safe).collect();
             let theme = Theme::detect();
             let cells: Vec<[String; 4]> = list.iter().map(ls_cells).collect();
             let widths = ls_widths(&cells);
@@ -2344,6 +2448,7 @@ fn run() -> Result<()> {
                 print_json(&show_json(i, links, cm, prs.as_deref()))?;
                 return Ok(());
             }
+            let i = display_safe(i);
             let t = Theme::detect();
             let (ids, hd) = (t.id, t.heading);
             anstream::println!(
@@ -2361,6 +2466,7 @@ fn run() -> Result<()> {
                 println!("\n{}", d.trim_end());
             }
             let links = fetch_links(&c, i["idReadable"].as_str().unwrap_or(&id), LINK_FIELDS)?;
+            let links: Vec<Value> = links.into_iter().map(display_safe).collect();
             if !links.is_empty() {
                 anstream::println!("\n{hd}-- links --{hd:#}");
                 print_link_groups(&links, &t);
@@ -2372,10 +2478,11 @@ fn run() -> Result<()> {
                     println!("no pull requests");
                 }
                 for (state, url) in &prs {
-                    let (ss, us) = (t.state(state), t.url);
+                    let state = sanitize_display(state);
+                    let (ss, us) = (t.state(&state), t.url);
                     anstream::println!(
                         "{ss}{state}{ss:#}  {us}{}{us:#}",
-                        url.as_deref().unwrap_or("")
+                        sanitize_display(url.as_deref().unwrap_or(""))
                     );
                 }
             }
@@ -2409,7 +2516,7 @@ fn run() -> Result<()> {
             // separate mutation fires project workflows (e.g. auto-assign on state
             // change) and there's no created-but-unconfigured partial-failure window.
             // If any field can't be resolved to a native type, fall back below.
-            let embedded = if field.is_empty() {
+            let mut embedded = if field.is_empty() {
                 false
             } else if let Some(cf) = resolve_custom_fields(&c, &pid, &short, &field) {
                 body["customFields"] = cf;
@@ -2417,7 +2524,16 @@ fn run() -> Result<()> {
             } else {
                 false
             };
-            let created = c.post("issues", &[("fields", "idReadable")], body)?;
+            let created = match c.post("issues", &[("fields", "idReadable")], body.clone()) {
+                Err(e) if embedded && e.to_string().starts_with("HTTP 400") => {
+                    embedded = false;
+                    if let Some(o) = body.as_object_mut() {
+                        o.remove("customFields");
+                    }
+                    c.post("issues", &[("fields", "idReadable")], body)?
+                }
+                r => r?,
+            };
             let id = created["idReadable"]
                 .as_str()
                 .context("create returned no id")?
@@ -2557,7 +2673,7 @@ fn run() -> Result<()> {
                 &format!("issues/{}/comments/{}", seg(&issue), seg(&comment_id)),
                 &[("fields", COMMENT_FIELDS)],
             )?;
-            let marker = visibility_marker(&cm["visibility"]);
+            let marker = visibility_marker(&display_safe(cm)["visibility"]);
             if marker.is_empty() {
                 println!("{comment_id} public");
             } else {
@@ -2653,7 +2769,11 @@ fn run() -> Result<()> {
             }
             match out {
                 None => {
-                    for a in &list {
+                    for a in &display_safe(Value::Array(list))
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                    {
                         println!(
                             "{}  {}",
                             a["name"].as_str().unwrap_or("?"),
@@ -2666,7 +2786,17 @@ fn run() -> Result<()> {
                     std::fs::create_dir_all(dir)?;
                     let mut used = std::collections::HashSet::new();
                     for a in &list {
-                        let id = a["id"].as_str().unwrap_or("unknown");
+                        let id: String = a["id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                            .collect();
+                        let id = if id.is_empty() {
+                            "unknown"
+                        } else {
+                            id.as_str()
+                        };
                         let name = unique_file_name(
                             safe_file_name(a["name"].as_str().unwrap_or(""), id),
                             id,
@@ -2676,9 +2806,24 @@ fn run() -> Result<()> {
                             .as_str()
                             .with_context(|| format!("attachment '{name}' has no url"))?;
                         let bytes = c.get_bytes(url)?;
-                        let path = std::path::Path::new(dir).join(&name);
-                        std::fs::write(&path, &bytes)?;
-                        println!("{}  {}", path.display(), bytes.len());
+                        let Some((mut file, path)) =
+                            create_new_file(std::path::Path::new(dir), &name, id)?
+                        else {
+                            eprintln!(
+                                "skipped {}: {} and {} already exist",
+                                sanitize_display(a["name"].as_str().unwrap_or("?")),
+                                name,
+                                id_suffixed(&name, id)
+                            );
+                            continue;
+                        };
+                        std::io::Write::write_all(&mut file, &bytes)
+                            .with_context(|| format!("cannot write {}", path.display()))?;
+                        println!(
+                            "{}  {}",
+                            sanitize_display(&path.display().to_string()),
+                            bytes.len()
+                        );
                     }
                 }
             }
@@ -2694,7 +2839,7 @@ fn run() -> Result<()> {
                 None => format!("issues/{}/attachments", seg(&id)),
             };
             for f in &files {
-                let a = c.post_file(&path, &[("fields", "id,name")], f)?;
+                let a = display_safe(c.post_file(&path, &[("fields", "id,name")], f)?);
                 println!(
                     "{}  {}",
                     a["id"].as_str().unwrap_or("?"),
@@ -2731,7 +2876,7 @@ fn run() -> Result<()> {
                 print_json(&tags)?;
                 return Ok(());
             }
-            let list = tags.as_array().cloned().unwrap_or_default();
+            let list = display_safe(tags).as_array().cloned().unwrap_or_default();
             if list.is_empty() {
                 println!("no tags");
             }
@@ -2780,8 +2925,8 @@ fn run() -> Result<()> {
                 print_json(&Value::Array(list))?;
                 return Ok(());
             }
-            for p in &list {
-                println!("{}", project_line(p));
+            for p in list.into_iter().map(display_safe) {
+                println!("{}", project_line(&p));
             }
         }
         Cmd::Write {
@@ -2815,7 +2960,7 @@ fn run() -> Result<()> {
                 &[("fields", "shortName,name")],
                 body,
             )?;
-            println!("{}", project_line(&updated));
+            println!("{}", project_line(&display_safe(updated)));
         }
         Cmd::Write {
             cmd:
@@ -2833,6 +2978,7 @@ fn run() -> Result<()> {
                 &[("fields", "id,shortName")],
                 json!({"name": name, "shortName": short, "leader": {"id": leader}}),
             )?;
+            let created = display_safe(created);
             println!(
                 "{}  {}",
                 created["shortName"].as_str().unwrap_or(&short),
@@ -2860,7 +3006,8 @@ fn run() -> Result<()> {
                 print_json(&fields)?;
                 return Ok(());
             }
-            let field_list = fields.as_array().cloned().unwrap_or_default();
+            let field_list = display_safe(fields).as_array().cloned().unwrap_or_default();
+            let short = sanitize_display(&short).into_owned();
             if field_list.is_empty() {
                 // field config needs project-admin rights; fall back to values observed on recent issues
                 let issues = c.get(
@@ -2875,7 +3022,7 @@ fn run() -> Result<()> {
                     String,
                     std::collections::BTreeSet<String>,
                 > = Default::default();
-                for i in issues.as_array().into_iter().flatten() {
+                for i in display_safe(issues).as_array().into_iter().flatten() {
                     for f in i["customFields"].as_array().into_iter().flatten() {
                         if let (Some(n), Some(v)) = (f["name"].as_str(), cf_value(&f["value"])) {
                             seen.entry(n.into()).or_default().insert(v);
@@ -2933,7 +3080,7 @@ fn run() -> Result<()> {
                 print_json(&u)?;
                 return Ok(());
             }
-            println!("{}", user_line(&u));
+            println!("{}", user_line(&display_safe(u)));
         }
         Cmd::Read {
             json,
@@ -2964,7 +3111,7 @@ fn run() -> Result<()> {
                 if list.is_empty() {
                     println!("no matches");
                 }
-                for u in &list {
+                for u in list.iter().cloned().map(display_safe) {
                     println!(
                         "{}  {}",
                         u["login"].as_str().unwrap_or("?"),
@@ -3023,6 +3170,7 @@ fn run() -> Result<()> {
             } else {
                 let t = Theme::detect();
                 let (ids, link) = (t.id, t.url);
+                let (rid, summary) = (sanitize_display(rid), sanitize_display(summary));
                 anstream::println!("{ids}{rid}{ids:#}  {summary}");
                 anstream::println!("{link}{url}{link:#}");
             }
@@ -3104,7 +3252,7 @@ fn reset_sigpipe() {}
 fn main() {
     reset_sigpipe();
     if let Err(e) = run() {
-        eprintln!("error: {e:#}");
+        eprintln!("error: {}", sanitize_display(&format!("{e:#}")));
         std::process::exit(1);
     }
 }
@@ -3151,6 +3299,77 @@ mod tests {
         assert_eq!(safe_file_name("a/..", "1-2"), "attachment-1-2");
         assert_eq!(safe_file_name("dir/", "1-2"), "attachment-1-2");
         assert_eq!(safe_file_name("bad\nname", "1-2"), "attachment-1-2");
+    }
+
+    #[test]
+    fn safe_file_name_prefixes_dotfiles_and_rejects_bidi() {
+        assert_eq!(safe_file_name(".envrc", "1-2"), "_.envrc");
+        assert_eq!(safe_file_name("dir/.bashrc", "1-2"), "_.bashrc");
+        assert_eq!(safe_file_name("a\u{202e}gpj.exe", "1-2"), "attachment-1-2");
+        assert_eq!(safe_file_name("a\u{1b}[2J", "1-2"), "attachment-1-2");
+    }
+
+    #[test]
+    fn sanitize_display_escapes_terminal_controls() {
+        assert!(matches!(
+            sanitize_display("plain\ttext\nnext"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(sanitize_display("a\u{1b}[2Kb"), "a\\x1b[2Kb");
+        assert_eq!(
+            sanitize_display("\u{1b}]52;c;aGk=\u{7}"),
+            "\\x1b]52;c;aGk=\\x07"
+        );
+        assert_eq!(sanitize_display("x\u{9b}31m\u{7f}"), "x\\x9b31m\\x7f");
+        assert_eq!(sanitize_display("ab\u{202e}cd"), "ab\\u{202e}cd");
+        assert_eq!(
+            sanitize_display("line\r\nnext\rover"),
+            "line\nnext\\x0dover"
+        );
+    }
+
+    #[test]
+    fn display_safe_cleans_nested_strings_only() {
+        let v = display_safe(json!({
+            "summary": "s\u{1b}[1A",
+            "n": 5,
+            "tags": [{"name": "t\u{7}"}],
+        }));
+        assert_eq!(
+            v,
+            json!({"summary": "s\\x1b[1A", "n": 5, "tags": [{"name": "t\\x07"}]})
+        );
+    }
+
+    #[test]
+    fn create_new_file_never_replaces_existing_files() {
+        let dir = scratch_dir("create-new-file");
+        std::fs::write(dir.join("Makefile"), "keep").unwrap();
+        let (_, p) = create_new_file(&dir, "Makefile", "1-9").unwrap().unwrap();
+        assert_eq!(p, dir.join("Makefile-1-9"));
+        assert!(create_new_file(&dir, "Makefile", "1-9").unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("Makefile")).unwrap(),
+            "keep"
+        );
+        let (_, p) = create_new_file(&dir, "new.txt", "1-9").unwrap().unwrap();
+        assert_eq!(p, dir.join("new.txt"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn server_help_matches_resolution_order() {
+        let cmd = Cli::command();
+        let help = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "server")
+            .and_then(|a| a.get_help())
+            .map(|h| h.to_string())
+            .unwrap();
+        assert!(help.contains("overrides YOUTRACK_URL"), "{help}");
+        let mut all = vec![];
+        help_strings(&Cli::command(), &mut all);
+        assert!(all.iter().all(|h| !h.contains("still take precedence")));
     }
 
     #[test]
@@ -4122,6 +4341,21 @@ mod tests {
     fn issue_cf_entry_user_me_falls_back_to_commands() {
         assert!(issue_cf_entry("Assignee", "SingleUserIssueCustomField", "me").is_none());
         assert!(issue_cf_entry("Assignee", "SingleUserIssueCustomField", "alice").is_some());
+    }
+
+    #[test]
+    fn issue_cf_entry_command_syntax_falls_back_to_commands() {
+        assert!(issue_cf_entry("State", "StateIssueCustomField", "{In Progress}").is_none());
+        assert!(
+            issue_cf_entry("Priority", "SingleEnumIssueCustomField", "{Show-stopper}").is_none()
+        );
+        assert!(issue_cf_entry("Assignee", "SingleUserIssueCustomField", "Unassigned").is_none());
+        assert!(issue_cf_entry("Assignee", "SingleUserIssueCustomField", "-").is_none());
+        assert!(
+            issue_cf_entry("Fix versions", "MultiVersionIssueCustomField", "1.0 2.0").is_none()
+        );
+        assert!(issue_cf_entry("Fix versions", "MultiVersionIssueCustomField", "1.0").is_some());
+        assert!(issue_cf_entry("State", "StateIssueCustomField", "In Progress").is_some());
     }
 
     #[test]

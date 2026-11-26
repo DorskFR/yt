@@ -9,7 +9,8 @@ The tree is `tier → noun → verb`. `yt read …` never mutates anything; `yt 
 ```
 yt read issue ls "QUERY" [-n 20] [--skip N] [--full] [--merged-pr]   search; one line per issue: ID  STATE  PRIO  @ASSIGNEE  SUMMARY [#tag ...]
                                             (a `# limit N reached; next page: --skip M` hint goes to stderr when -n is hit;
-                                            --merged-pr keeps only issues with a merged PR, one extra call per row)
+                                            --merged-pr keeps only issues with a merged PR, one extra call per row;
+                                            an empty filtered page prints `no matches in this page (N fetched)`)
 yt read issue show ID [-c] [--pr]           issue detail (fields, tags, links); -c appends comments, --pr linked PRs
 yt read issue open ID [-p]                  print ID  SUMMARY + web URL, then open it in the browser
                                             (-p/--print-only, --json, or a non-TTY stdout skip the launch)
@@ -57,7 +58,7 @@ yt write update [--force]                   self-update to the latest release
 
 ```
 yt completions SHELL      print a completion script (bash|zsh|fish|powershell|elvish)
---server NAME             use a named server for any command
+--server NAME             use a named server for any command (overrides YOUTRACK_URL/YOUTRACK_API_TOKEN)
 --silent                  mute watcher notifications on writes (or YT_MUTE_NOTIFICATIONS=1)
 --agent                   plain, stable output: no colour, no update notice (or YT_AGENT=1)
 --json                    (read tier, anywhere after `read`) raw JSON instead of text, with entity ids
@@ -85,6 +86,14 @@ Output goes through [`anstream`](https://docs.rs/anstream): colour is off when s
 
 `--silent` (or `YT_MUTE_NOTIFICATIONS=1`; the flag wins) sends `muteUpdateNotifications=true` on `yt write issue …` calls so watchers are not emailed. The server honours it only when the token's user has the *Apply Commands Silently* permission.
 
+## Attachments
+
+`yt read issue attachments ID -o [DIR]` never replaces an existing file. A name that is already taken in `DIR` is saved as `NAME-ATTACHMENT_ID.EXT`; when that exists too, the attachment is skipped with a `skipped ...` line on stderr. Path components are stripped from server-supplied names, names with control characters become `attachment-ID`, and names starting with a dot get a `_` prefix (`.envrc` is saved as `_.envrc`).
+
+## Untrusted text
+
+Summaries, descriptions, comments, names and other server-supplied text are printed with control characters (except newline and tab) and bidi overrides shown as `\x1b`/`\u{202e}`-style escapes, so issue content cannot drive the terminal. `--json` and `yt read api` print the raw response; JSON escaping already covers control characters there.
+
 ## Comments
 
 - Comment ids are the values in parentheses in `yt read issue comments` output (e.g. `4-123`).
@@ -95,7 +104,7 @@ Output goes through [`anstream`](https://docs.rs/anstream): colour is off when s
 
 ## Fields on create
 
-`-f` on `write issue new` takes YouTrack command syntax (`-f "Priority Critical" -f "Type Bug"`). Fields whose type can be resolved are set atomically in the create call. Otherwise (unknown field type, `Assignee me`, ...) they are applied as a command right after creation. `yt read project fields PROJECT` lists a project's fields and values.
+`-f` on `write issue new` takes YouTrack command syntax (`-f "Priority Critical" -f "Type Bug"`). Fields whose type can be resolved are set atomically in the create call. Otherwise (unknown field type, braced values such as `State {In Progress}`, keywords such as `Assignee me` or `Assignee Unassigned`, several values for a multi-value field, ...) they are applied as a command right after creation. If the server rejects the native field values with `HTTP 400`, the issue is created without them and the command is applied instead. `yt read project fields PROJECT` lists a project's fields and values.
 
 ## Projects
 
