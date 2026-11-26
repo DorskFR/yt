@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -72,6 +72,7 @@ fn route(method: &str, path: &str, body: &Value) -> (u16, String) {
         ),
         ("POST", "/api/issues") => (200, j(json!({"idReadable": "DEMO-9"}))),
         ("POST", "/api/commands") => (200, j(json!({}))),
+        ("POST", "/api/issues/DEMO-1/comments") => (200, j(json!({"id": "4-7"}))),
         _ => (404, j(json!({"error": "Not Found"}))),
     }
 }
@@ -309,4 +310,69 @@ fn rejected_native_fields_retry_without_them() {
     assert!(reqs[0].1.get("customFields").is_some());
     assert!(reqs[1].1.get("customFields").is_none());
     assert_eq!(reqs[2].1["query"], "Priority Bogus");
+}
+
+#[test]
+fn comment_prints_the_new_comment_id() {
+    let m = mock();
+    let o = yt(
+        &m,
+        &["write", "issue", "comment", "DEMO-1", "- fixed\n- tested"],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(stdout(&o).trim(), "4-7");
+    let log = m.log.lock().unwrap();
+    let (_, _, body) = log
+        .iter()
+        .find(|(meth, p, _)| meth == "POST" && p == "/api/issues/DEMO-1/comments")
+        .unwrap();
+    assert_eq!(body["text"], "- fixed\n- tested");
+}
+
+fn auth(home: &std::path::Path, args: &[&str], stdin: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yt"))
+        .args(["write", "server", "auth"])
+        .args(args)
+        .env_remove("YOUTRACK_URL")
+        .env_remove("YOUTRACK_API_TOKEN")
+        .env("YT_NO_UPDATE_CHECK", "1")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn yt");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn server_auth_reads_the_token_from_stdin_and_warns_on_argv() {
+    let home = scratch("auth");
+    let cfg = || std::fs::read_to_string(home.join("yt/config.json")).unwrap();
+
+    let o = auth(&home, &["https://a.example"], "perm-stdin\n");
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("warning"), "{}", stderr(&o));
+    assert!(cfg().contains("perm-stdin"));
+
+    let o = auth(&home, &["https://b.example", "-", "b"], "perm-dash");
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(cfg().contains("perm-dash"));
+
+    let o = auth(&home, &["https://c.example", "perm-argv", "c"], "");
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stderr(&o).contains("shell history"), "{}", stderr(&o));
+    assert!(cfg().contains("perm-argv"));
+
+    let o = auth(&home, &["https://d.example"], "  \n");
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("no token"), "{}", stderr(&o));
+    std::fs::remove_dir_all(&home).unwrap();
 }

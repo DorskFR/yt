@@ -14,7 +14,7 @@ Requests only the fields it prints: a 20-issue search returns about 2 KB instead
 yt read issue ls "project: DEMO #Unresolved"         # one line per issue
 yt read issue show DEMO-42 -c                        # fields, links, comments
 yt write issue new DEMO "Summary" -d -               # prints the new ID; description from stdin
-yt write issue comment DEMO-42 "text"                # prints ok
+yt write issue comment DEMO-42 "text"                # prints the comment id
 yt write issue cmd "State {In Progress}" DEMO-42     # any YouTrack command, on one or more issues
 yt read --json issue show DEMO-42                    # raw JSON with entity ids
 ```
@@ -40,7 +40,7 @@ Update with `yt write update`. Details in [docs/updating.md](docs/updating.md).
 ## Quick start
 
 ```console
-$ yt write server auth https://youtrack.example.com perm-...   # token "-" reads stdin
+$ yt write server auth https://youtrack.example.com           # prompts for the token (or pipe it on stdin)
 $ yt read issue ls "project: DEMO #Unresolved"
 DEMO-42  In Progress  Critical  @alice  Login page times out on slow networks #auth
 DEMO-47  Open         Major     @bob    Password reset email has a broken link #auth #email

@@ -36,7 +36,7 @@ yt read api PATH [--fields F] [--query K=V]... [--top N] [--skip N] [--all]   ra
 ```
 yt write issue new PROJECT "SUMMARY" [-d DESC|-d -] [-f "Priority Critical"]...  prints new ID only
 yt write issue edit ID [-s "SUMMARY"] [-d DESC|-d -]   edit summary/description; prints ID
-yt write issue comment ID [TEXT] [--public|--group G...|--user U...]   add comment (stdin if TEXT omitted); prints ok
+yt write issue comment ID [TEXT] [--public|--group G...|--user U...]   add comment (stdin if TEXT omitted); prints the new comment id
 yt write issue comment-edit ID COMMENT_ID [TEXT]   replace a comment's text (stdin if TEXT omitted)
 yt write issue comment-delete ID COMMENT_ID [--permanent]   delete a comment (trash; --permanent erases it)
 yt write issue comment-visibility ID COMMENT_ID (--public|--group G...|--user U...)   change a comment's visibility; prints the result
@@ -49,7 +49,7 @@ yt write issue untag ID TAG                 remove a tag (by name) from an issue
 yt write project create SHORT NAME          create a project (prints SHORT  ID); needs an admin token
 yt write project edit PROJECT [--name N] [--description D] [--leader LOGIN] [--archived true|false]
                                             edit a project (prints SHORT  NAME); needs an admin token
-yt write server auth URL TOKEN [NAME]       save credentials (NAME defaults to "default")
+yt write server auth URL [TOKEN|-] [NAME]   save credentials (NAME defaults to "default"; token from stdin when omitted)
 yt write server default NAME                set the default server
 yt write update [--force]                   self-update to the latest release
 ```
@@ -96,11 +96,21 @@ Summaries, descriptions, comments, names and other server-supplied text are prin
 
 ## Comments
 
+- `comment` prints the new comment's id (e.g. `4-123`), ready for `comment-edit`, `comment-delete`, `comment-visibility` or `attach -c`.
+
 - Comment ids are the values in parentheses in `yt read issue comments` output (e.g. `4-123`).
 - `comment` and `comment-visibility` accept `--public`, or any mix of `--group NAME` and `--user LOGIN` (both repeatable). Without them, `comment` uses the default visibility.
 - `comment-edit ID COMMENT_ID [TEXT]` replaces the text, reading stdin when `TEXT` is omitted.
 - `comment-delete ID COMMENT_ID` moves the comment to the trash, as the web UI does; an ordinary token may do this. Trashed comments disappear from `yt read issue comments` and carry `"deleted": true` under `--json`.
 - `--permanent` also erases the comment. It needs the *Delete Comment permanently* permission; without it the comment is still trashed and the command exits non-zero.
+
+## Name matching
+
+Projects are matched by exact short name first, then case-insensitive short name, then case-insensitive name; several matches at the same level are an error that lists them. Tags match case-insensitively; among several, an exact-case name wins, then the tag owned by the current user, otherwise the command fails and lists the owners.
+
+## Timeouts
+
+API requests give up after 60s without a response (30s to connect); attachment downloads and uploads get 15 minutes. The error says so, and notes that a write may still have been applied.
 
 ## Fields on create
 
@@ -108,7 +118,7 @@ Summaries, descriptions, comments, names and other server-supplied text are prin
 
 ## Projects
 
-`yt write project create` POSTs to `/api/admin/projects` and needs a token with admin permissions; a non-admin token returns `HTTP 403` with the server's message. The current user becomes project leader. `yt write project edit` POSTs only the given fields to `/api/admin/projects/{id}`; with no flag it changes nothing and makes no request. Creating or attaching project custom fields is also admin-only and is not implemented.
+`yt write project create` POSTs to `/api/admin/projects` and needs a token with admin permissions; a non-admin token returns `HTTP 403` with the server's message. The current user becomes project leader. `yt write project edit` POSTs only the given fields to `/api/admin/projects/{id}`; with no flag it is a usage error (exit 2) and makes no request. Creating or attaching project custom fields is also admin-only and is not implemented.
 
 ## Shell completions
 

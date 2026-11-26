@@ -250,6 +250,7 @@ enum WriteIssueCmd {
         /// Project short name or name, e.g. DEMO
         project: String,
         /// Issue summary (title)
+        #[arg(allow_hyphen_values = true)]
         summary: String,
         /// Description ("-" reads stdin)
         #[arg(short, long, allow_hyphen_values = true)]
@@ -285,6 +286,7 @@ enum WriteIssueCmd {
         /// Issue id, e.g. DEMO-1
         id: String,
         /// Comment text (reads stdin when omitted)
+        #[arg(allow_hyphen_values = true)]
         text: Option<String>,
         /// Make the comment visible to everyone
         #[arg(long, conflicts_with_all = ["group", "user"])]
@@ -303,6 +305,7 @@ enum WriteIssueCmd {
         /// Comment id as printed in parentheses by `yt read issue comments` (e.g. 4-123)
         comment_id: String,
         /// New comment text (reads stdin when omitted)
+        #[arg(allow_hyphen_values = true)]
         text: Option<String>,
     },
     /// Delete an existing comment (moves it to the trash; --permanent erases it)
@@ -359,7 +362,7 @@ enum WriteIssueCmd {
         #[arg(required = true)]
         ids: Vec<String>,
         /// Comment to add alongside the command
-        #[arg(short = 'm', long)]
+        #[arg(short = 'm', long, allow_hyphen_values = true)]
         comment: Option<String>,
     },
     /// Add a tag (by name) to an issue
@@ -388,20 +391,21 @@ enum WriteProjectCmd {
         name: String,
     },
     /// Edit a project (requires an admin token); prints SHORT  NAME
+    #[command(group(clap::ArgGroup::new("change").required(true).multiple(true)))]
     Edit {
         /// Project short name or name, e.g. DEMO
         project: String,
         /// New full name
-        #[arg(long)]
+        #[arg(long, group = "change")]
         name: Option<String>,
         /// New description
-        #[arg(long)]
+        #[arg(long, group = "change")]
         description: Option<String>,
         /// New leader login
-        #[arg(long)]
+        #[arg(long, group = "change")]
         leader: Option<String>,
         /// Archive (true) or unarchive (false)
-        #[arg(long)]
+        #[arg(long, group = "change")]
         archived: Option<bool>,
     },
 }
@@ -412,8 +416,8 @@ enum WriteServerCmd {
     Auth {
         /// YouTrack base URL, e.g. https://youtrack.example.com
         url: String,
-        /// Permanent API token ("-" reads stdin)
-        token: String,
+        /// Permanent API token; omit or "-" to read it from stdin (hidden prompt on a terminal)
+        token: Option<String>,
         /// Server name; defaults to "default" (warns if overwriting an existing default)
         name: Option<String>,
     },
@@ -673,12 +677,43 @@ fn tls_hint(err: &str) -> Option<&'static str> {
 /// An HTTP agent. HTTP error statuses are returned as responses so the
 /// server's error body can be reported; proxies are not read from the
 /// environment. The client certificate, if any, is presented on request.
+const API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+fn timeout_message(t: ureq::Timeout) -> String {
+    let limit = match t {
+        ureq::Timeout::SendBody | ureq::Timeout::RecvBody => "the transfer limit",
+        ureq::Timeout::Connect => "30s",
+        _ => "60s",
+    };
+    format!(
+        "timed out after {limit} waiting for the server ({t}); a write may still have been applied, check before retrying"
+    )
+}
+
+fn transport_error(e: ureq::Error) -> anyhow::Error {
+    match e {
+        ureq::Error::Timeout(t) => anyhow::anyhow!(timeout_message(t)),
+        e => {
+            let msg = e.to_string();
+            match tls_hint(&msg) {
+                Some(h) => anyhow::anyhow!("{msg}\n{h}"),
+                None => anyhow::anyhow!(msg),
+            }
+        }
+    }
+}
+
 fn http_agent(client_cert: Option<ureq::tls::ClientCert>) -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .proxy(None)
         .max_redirects(5)
         .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .timeout_send_request(Some(API_TIMEOUT))
+        .timeout_send_body(Some(API_TIMEOUT))
+        .timeout_recv_response(Some(API_TIMEOUT))
+        .timeout_recv_body(Some(API_TIMEOUT))
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .root_certs(ureq::tls::RootCerts::PlatformVerifier)
@@ -869,13 +904,16 @@ impl Client {
             .agent
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.token))
+            .config()
+            .timeout_recv_body(Some(FILE_TIMEOUT))
+            .build()
             .call();
-        let mut buf = Vec::new();
         check(res)?
             .into_body()
-            .into_reader()
-            .read_to_end(&mut buf)?;
-        Ok(buf)
+            .with_config()
+            .limit(u64::MAX)
+            .read_to_vec()
+            .map_err(transport_error)
     }
 
     /// POST a single file as multipart/form-data (field name `file`) to a
@@ -905,6 +943,9 @@ impl Client {
         let res = self
             .prepare("POST", self.agent.post(self.url(path)), params)
             .content_type(format!("multipart/form-data; boundary={boundary}"))
+            .config()
+            .timeout_send_body(Some(FILE_TIMEOUT))
+            .build()
             .send(&body[..]);
         read(res)
     }
@@ -1071,16 +1112,7 @@ fn http_error_message(body: &str) -> String {
 /// Turn transport failures and 4xx/5xx statuses into errors, keeping the
 /// server's message. Anything else is handed back for reading.
 fn check(res: Result<HttpResponse, ureq::Error>) -> Result<HttpResponse> {
-    let mut r = match res {
-        Ok(r) => r,
-        Err(e) => {
-            let msg = e.to_string();
-            match tls_hint(&msg) {
-                Some(h) => bail!("{msg}\n{h}"),
-                None => bail!(msg),
-            }
-        }
-    };
+    let mut r = res.map_err(transport_error)?;
     let code = r.status().as_u16();
     if code >= 400 {
         let body = r.body_mut().read_to_string().unwrap_or_default();
@@ -1090,7 +1122,10 @@ fn check(res: Result<HttpResponse, ureq::Error>) -> Result<HttpResponse> {
 }
 
 fn read(res: Result<HttpResponse, ureq::Error>) -> Result<Value> {
-    let s = check(res)?.body_mut().read_to_string()?;
+    let s = check(res)?
+        .body_mut()
+        .read_to_string()
+        .map_err(transport_error)?;
     Ok(if s.is_empty() {
         Value::Null
     } else {
@@ -1472,6 +1507,66 @@ fn project_line(p: &Value) -> String {
     )
 }
 
+/// The API token from the argument, or from stdin when it is omitted or "-":
+/// a hidden prompt on a terminal, the whole input otherwise.
+fn read_token(arg: Option<&str>) -> Result<String> {
+    let raw = match arg {
+        Some(t) if t != "-" => t.to_string(),
+        _ if std::io::stdin().is_terminal() => {
+            eprint!("token: ");
+            let echo = EchoOff::new();
+            let mut s = String::new();
+            let r = std::io::stdin().read_line(&mut s);
+            drop(echo);
+            eprintln!();
+            r.context("reading token")?;
+            s
+        }
+        _ => stdin_text()?,
+    };
+    let token = raw.trim().to_string();
+    if token.is_empty() {
+        bail!("no token given (pass it as TOKEN or on stdin)");
+    }
+    Ok(token)
+}
+
+/// Turns terminal echo off on stdin until dropped.
+struct EchoOff(#[cfg(unix)] Option<libc::termios>);
+
+impl EchoOff {
+    #[cfg(unix)]
+    fn new() -> Self {
+        let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr fills `t` on success; it is only read when it returned 0.
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, t.as_mut_ptr()) } != 0 {
+            return Self(None);
+        }
+        // SAFETY: initialised by the successful tcgetattr above.
+        let orig = unsafe { t.assume_init() };
+        let mut quiet = orig;
+        quiet.c_lflag &= !libc::ECHO;
+        // SAFETY: valid termios for the stdin fd.
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &quiet) };
+        Self(Some(orig))
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> Self {
+        Self()
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(orig) = self.0 {
+            // SAFETY: restores the attributes read in `new`.
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &orig) };
+        }
+    }
+}
+
 fn stdin_text() -> Result<String> {
     let mut s = String::new();
     std::io::stdin().read_to_string(&mut s)?;
@@ -1480,25 +1575,39 @@ fn stdin_text() -> Result<String> {
 
 fn resolve_project(c: &Client, key: &str) -> Result<(String, String)> {
     let projects = c.get_all("admin/projects", &[("fields", "id,shortName,name")])?;
-    projects
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|p| {
-            p["shortName"]
-                .as_str()
-                .is_some_and(|s| s.eq_ignore_ascii_case(key))
-                || p["name"]
-                    .as_str()
-                    .is_some_and(|s| s.eq_ignore_ascii_case(key))
-        })
-        .map(|p| {
-            (
-                p["id"].as_str().unwrap_or_default().to_string(),
-                p["shortName"].as_str().unwrap_or(key).to_string(),
-            )
-        })
-        .with_context(|| format!("project not found: {key}"))
+    pick_project(&projects, key)
+}
+
+/// The project `key` names: an exact short name, then a case-insensitive short
+/// name, then a case-insensitive name. Several hits at that level are an error. Pure.
+fn pick_project(projects: &Value, key: &str) -> Result<(String, String)> {
+    let all: Vec<&Value> = projects.as_array().into_iter().flatten().collect();
+    let field = |p: &Value, k: &str| p[k].as_str().unwrap_or_default().to_string();
+    let levels: [&dyn Fn(&Value) -> bool; 3] = [
+        &|p| field(p, "shortName") == key,
+        &|p| field(p, "shortName").eq_ignore_ascii_case(key),
+        &|p| field(p, "name").eq_ignore_ascii_case(key),
+    ];
+    for matches in levels {
+        let hits: Vec<&Value> = all.iter().copied().filter(|p| matches(p)).collect();
+        match hits.as_slice() {
+            [] => continue,
+            [p] => {
+                return Ok((
+                    field(p, "id"),
+                    p["shortName"].as_str().unwrap_or(key).to_string(),
+                ))
+            }
+            many => bail!(
+                "project '{key}' is ambiguous: {}",
+                many.iter()
+                    .map(|p| format!("{} ({})", field(p, "shortName"), field(p, "name")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+    bail!("project not found: {key}")
 }
 
 /// Build one `customFields` entry for the create body from a field name, the
@@ -1751,17 +1860,87 @@ fn resolve_visibility(
 
 /// Resolve a tag name to its internal id via GET /api/tags.
 fn resolve_tag(c: &Client, name: &str) -> Result<String> {
-    let tags = c.get_all("tags", &[("fields", "id,name")])?;
+    let tags = c.get_all("tags", &[("fields", "id,name,owner(login)")])?;
+    match pick_tag(&tags, name, None) {
+        Err(TagPick::Ambiguous) => {
+            let me = c.get("users/me", &[("fields", "login")])?;
+            pick_tag(&tags, name, me["login"].as_str()).map_err(|e| e.into_error(&tags, name))
+        }
+        r => r.map_err(|e| e.into_error(&tags, name)),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum TagPick {
+    Missing,
+    Ambiguous,
+}
+
+impl TagPick {
+    fn into_error(self, tags: &Value, name: &str) -> anyhow::Error {
+        match self {
+            Self::Missing => anyhow::anyhow!("tag not found: {name}"),
+            Self::Ambiguous => anyhow::anyhow!(
+                "tag '{name}' is ambiguous: {}",
+                tag_matches(tags, name)
+                    .iter()
+                    .map(|t| format!(
+                        "{} (owner {})",
+                        t["name"].as_str().unwrap_or("?"),
+                        t["owner"]["login"].as_str().unwrap_or("?")
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+fn tag_matches<'a>(tags: &'a Value, name: &str) -> Vec<&'a Value> {
     tags.as_array()
         .into_iter()
         .flatten()
-        .find(|t| {
+        .filter(|t| {
             t["name"]
                 .as_str()
                 .is_some_and(|n| n.eq_ignore_ascii_case(name))
         })
-        .and_then(|t| t["id"].as_str().map(String::from))
-        .with_context(|| format!("tag not found: {name}"))
+        .collect()
+}
+
+/// The id of the tag `name` names (case-insensitive). Among several, an
+/// exact-case match wins, then the one owned by `me` when given. Pure.
+fn pick_tag(tags: &Value, name: &str, me: Option<&str>) -> Result<String, TagPick> {
+    let hits = tag_matches(tags, name);
+    let one = |v: Vec<&Value>| match v.as_slice() {
+        [t] => Some(t["id"].as_str().unwrap_or_default().to_string()),
+        _ => None,
+    };
+    if hits.is_empty() {
+        return Err(TagPick::Missing);
+    }
+    if let Some(id) = one(hits.clone()) {
+        return Ok(id);
+    }
+    let exact: Vec<&Value> = hits
+        .iter()
+        .copied()
+        .filter(|t| t["name"].as_str() == Some(name))
+        .collect();
+    if let Some(id) = one(exact.clone()) {
+        return Ok(id);
+    }
+    let pool = if exact.is_empty() { hits } else { exact };
+    if let Some(me) = me {
+        let mine = pool
+            .into_iter()
+            .filter(|t| t["owner"]["login"].as_str() == Some(me))
+            .collect();
+        if let Some(id) = one(mine) {
+            return Ok(id);
+        }
+    }
+    Err(TagPick::Ambiguous)
 }
 
 /// Extract pull-request state changes (state, optional url) from a
@@ -2278,11 +2457,12 @@ fn run_local(cmd: &Cmd) -> Result<bool> {
                     cmd: WriteServerCmd::Auth { url, token, name },
                 },
         } => {
-            let token = if token == "-" {
-                stdin_text()?
-            } else {
-                token.clone()
-            };
+            if token.as_deref().is_some_and(|t| t != "-") {
+                eprintln!(
+                    "warning: a token on the command line ends up in shell history and the process list; omit it or pass \"-\" to read it from stdin"
+                );
+            }
+            let token = read_token(token.as_deref())?;
             let mut cfg = Config::load()?;
             let name = name.clone().unwrap_or_else(|| "default".to_string());
             if name == "default" && cfg.servers.contains_key("default") {
@@ -2600,8 +2780,12 @@ fn run() -> Result<()> {
             if public || !group.is_empty() || !user.is_empty() {
                 body["visibility"] = resolve_visibility(&c, public, &group, &user)?;
             }
-            c.post(&format!("issues/{}/comments", seg(&id)), &[], body)?;
-            println!("ok");
+            let created = c.post(
+                &format!("issues/{}/comments", seg(&id)),
+                &[("fields", "id")],
+                body,
+            )?;
+            println!("{}", created["id"].as_str().unwrap_or("ok"));
         }
         Cmd::Write {
             cmd:
@@ -2942,10 +3126,6 @@ fn run() -> Result<()> {
                         },
                 },
         } => {
-            if name.is_none() && description.is_none() && leader.is_none() && archived.is_none() {
-                eprintln!("nothing to change: pass --name, --description, --leader or --archived");
-                return Ok(());
-            }
             let (pid, _) = resolve_project(&c, &project)?;
             let leader_id = leader.as_deref().map(|l| resolve_user(&c, l)).transpose()?;
             let body = project_edit_body(
@@ -3527,7 +3707,17 @@ mod tests {
 
     #[test]
     fn project_edit_flags() {
-        assert!(Cli::try_parse_from(["yt", "write", "project", "edit", "DEMO"]).is_ok());
+        assert!(Cli::try_parse_from(["yt", "write", "project", "edit", "DEMO"]).is_err());
+        assert!(Cli::try_parse_from([
+            "yt",
+            "write",
+            "project",
+            "edit",
+            "DEMO",
+            "--archived",
+            "true"
+        ])
+        .is_ok());
         assert!(Cli::try_parse_from([
             "yt",
             "write",
@@ -3706,9 +3896,114 @@ mod tests {
             &[
                 "yt", "write", "issue", "edit", "X-1", "-s", "- item", "-d", "--x",
             ][..],
+            &["yt", "write", "issue", "new", "X", "-0 offset bug"][..],
+            &[
+                "yt",
+                "write",
+                "issue",
+                "comment",
+                "X-1",
+                "- fixed\n- added test",
+            ][..],
+            &[
+                "yt", "write", "issue", "comment", "X-1", "- item", "--public",
+            ][..],
+            &[
+                "yt",
+                "write",
+                "issue",
+                "comment-edit",
+                "X-1",
+                "4-1",
+                "- item",
+            ][..],
+            &[
+                "yt",
+                "write",
+                "issue",
+                "cmd",
+                "State Fixed",
+                "X-1",
+                "-m",
+                "- done",
+            ][..],
         ] {
             assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
         }
+        let cli = Cli::try_parse_from([
+            "yt", "write", "issue", "comment", "X-1", "- item", "--public",
+        ])
+        .unwrap();
+        let Cmd::Write {
+            cmd:
+                WriteCmd::Issue {
+                    cmd: WriteIssueCmd::Comment { text, public, .. },
+                },
+        } = cli.cmd
+        else {
+            panic!("not a comment");
+        };
+        assert_eq!(text.as_deref(), Some("- item"));
+        assert!(public);
+    }
+
+    #[test]
+    fn pick_project_prefers_exact_short_name_and_rejects_ambiguity() {
+        let ps = json!([
+            {"id": "0-2", "shortName": "INF", "name": "Ops"},
+            {"id": "0-1", "shortName": "OPS", "name": "Platform"},
+            {"id": "0-3", "shortName": "ops2", "name": "Platform"},
+        ]);
+        assert_eq!(pick_project(&ps, "ops").unwrap().1, "OPS");
+        assert_eq!(pick_project(&ps, "OPS").unwrap().1, "OPS");
+        assert_eq!(pick_project(&ps, "inf").unwrap().0, "0-2");
+        let e = pick_project(&ps, "platform").unwrap_err().to_string();
+        assert!(
+            e.contains("ambiguous") && e.contains("OPS (Platform)") && e.contains("ops2"),
+            "{e}"
+        );
+        assert!(pick_project(&ps, "nope")
+            .unwrap_err()
+            .to_string()
+            .contains("not found"));
+        let ps = json!([
+            {"id": "0-1", "shortName": "Ab", "name": "x"},
+            {"id": "0-2", "shortName": "AB", "name": "y"},
+        ]);
+        assert_eq!(pick_project(&ps, "AB").unwrap().0, "0-2");
+        assert!(pick_project(&ps, "ab").is_err());
+    }
+
+    #[test]
+    fn pick_tag_prefers_exact_case_then_own_tag() {
+        let tags = json!([
+            {"id": "6-1", "name": "review", "owner": {"login": "bob"}},
+            {"id": "6-2", "name": "review", "owner": {"login": "me"}},
+            {"id": "6-3", "name": "Solo", "owner": {"login": "bob"}},
+            {"id": "6-4", "name": "Case", "owner": {"login": "bob"}},
+            {"id": "6-5", "name": "case", "owner": {"login": "me"}},
+        ]);
+        assert_eq!(pick_tag(&tags, "solo", None), Ok("6-3".into()));
+        assert_eq!(pick_tag(&tags, "review", None), Err(TagPick::Ambiguous));
+        assert_eq!(pick_tag(&tags, "review", Some("me")), Ok("6-2".into()));
+        assert_eq!(
+            pick_tag(&tags, "review", Some("eve")),
+            Err(TagPick::Ambiguous)
+        );
+        assert_eq!(pick_tag(&tags, "Case", None), Ok("6-4".into()));
+        assert_eq!(pick_tag(&tags, "CASE", Some("me")), Ok("6-5".into()));
+        assert_eq!(pick_tag(&tags, "nope", None), Err(TagPick::Missing));
+        let e = TagPick::Ambiguous.into_error(&tags, "review").to_string();
+        assert!(e.contains("owner bob") && e.contains("owner me"), "{e}");
+    }
+
+    #[test]
+    fn server_auth_token_is_optional() {
+        assert!(Cli::try_parse_from(["yt", "write", "server", "auth", "https://x"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["yt", "write", "server", "auth", "https://x", "-", "n"]).is_ok()
+        );
+        assert_eq!(read_token(Some(" perm-1 ")).unwrap(), "perm-1");
     }
 
     #[test]
@@ -4226,6 +4521,17 @@ mod tests {
             cfg.timeouts().connect,
             Some(std::time::Duration::from_secs(30))
         );
+    }
+
+    #[test]
+    fn http_agent_bounds_stalled_responses() {
+        let t = http_agent(None).config().timeouts();
+        assert_eq!(t.recv_response, Some(API_TIMEOUT));
+        assert_eq!(t.recv_body, Some(API_TIMEOUT));
+        assert_eq!(t.send_body, Some(API_TIMEOUT));
+        assert_eq!(t.global, None);
+        assert!(timeout_message(ureq::Timeout::RecvResponse).contains("60s"));
+        assert!(timeout_message(ureq::Timeout::RecvResponse).contains("check before retrying"));
     }
 
     #[test]
